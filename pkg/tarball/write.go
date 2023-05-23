@@ -24,7 +24,7 @@ import (
 	"os"
 	"syscall"
 
-	gzip "golang.org/x/build/pargzip"
+	gzip "github.com/klauspost/pgzip"
 	"golang.org/x/sys/unix"
 
 	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
