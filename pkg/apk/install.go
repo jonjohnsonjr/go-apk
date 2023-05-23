@@ -26,7 +26,6 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/gzip"
-	"github.com/klauspost/readahead"
 )
 
 // writeOneFile writes one file from the APK given the tar header and tar reader.
@@ -72,8 +71,6 @@ func (a *APK) installAPKFiles(gzipIn io.Reader, origin, replaces string) ([]tar.
 	if err != nil {
 		return nil, err
 	}
-	ra := readahead.NewReader(gr)
-	defer ra.Close()
 	tmpDir, err := os.MkdirTemp("", "apk-install")
 	if err != nil {
 		return nil, fmt.Errorf("unable to create temporary directory for unpacking an apk: %w", err)
@@ -85,7 +82,7 @@ func (a *APK) installAPKFiles(gzipIn io.Reader, origin, replaces string) ([]tar.
 	//  * This does not make any sense if the file has v2.0
 	//  * style .PKGINFO
 	var startedDataSection bool
-	tr := tar.NewReader(ra)
+	tr := tar.NewReader(gr)
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
