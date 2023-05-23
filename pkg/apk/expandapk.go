@@ -9,6 +9,7 @@ package apk
 import (
 	"archive/tar"
 	"bufio"
+	"compress/flate"
 	"errors"
 	"fmt"
 	"io"
@@ -162,33 +163,37 @@ func (w expandApkWriter) CloseFile() error {
 // is less than the size of the incoming buffer. To fix this, the Read() method on this
 // Reader has been modified to read only a single byte at a time to workaround the issue.
 type expandApkReader struct {
-	io.Reader
-	fast bool
+	r flate.Reader
+	w io.Writer
 }
 
-func newExpandApkReader(r io.Reader) *expandApkReader {
+func newExpandApkReader(r flate.Reader, w io.Writer) *expandApkReader {
 	return &expandApkReader{
-		Reader: r,
-		fast:   false,
+		r: r,
+		w: w,
 	}
 }
 
-func (r *expandApkReader) Read(b []byte) (int, error) {
-	if r.fast {
-		return r.Reader.Read(b)
+func (r *expandApkReader) Read(p []byte) (n int, err error) {
+	n, err = r.r.Read(p)
+	if n > 0 {
+		if n, err := r.w.Write(p[:n]); err != nil {
+			return n, err
+		}
 	}
-	buf := make([]byte, 1)
-	n, err := r.Reader.Read(buf)
-	if err != nil && err != io.EOF {
-		err = fmt.Errorf("expandApkReader.Read: %w", err)
-	} else {
-		b[0] = buf[0]
-	}
-	return n, err
+
+	return
 }
 
-func (r *expandApkReader) EnableFastRead() {
-	r.fast = true
+func (r *expandApkReader) ReadByte() (byte, error) {
+	b, err := r.r.ReadByte()
+	if err == nil {
+		if _, err := r.w.Write([]byte{b}); err != nil {
+			return b, err
+		}
+	}
+
+	return b, err
 }
 
 // ExpandAPK given a ready to an apk stream, normally a tar stream with gzip compression,
@@ -213,8 +218,7 @@ func ExpandApk(source io.Reader) (*APKExpanded, error) {
 	if err != nil {
 		return nil, fmt.Errorf("expandApk error 1: %w", err)
 	}
-	exR := newExpandApkReader(source)
-	tr := io.TeeReader(exR, sw)
+	tr := newExpandApkReader(bufio.NewReader(source), sw)
 	gzi, err := gzip.NewReader(tr)
 	if err != nil {
 		return nil, fmt.Errorf("expandApk error 2: %w", err)
@@ -240,7 +244,6 @@ func ExpandApk(source io.Reader) (*APKExpanded, error) {
 		if err := sw.Next(); err != nil {
 			if err == errExpandApkWriterMaxStreams {
 				maxStreamsReached = true
-				exR.EnableFastRead()
 			} else {
 				return nil, fmt.Errorf("expandApk error 5: %w", err)
 			}

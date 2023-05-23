@@ -36,7 +36,6 @@ import (
 
 	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
 	logger "github.com/chainguard-dev/go-apk/pkg/logger"
-	"github.com/klauspost/readahead"
 )
 
 type APK struct {
@@ -596,9 +595,7 @@ func (a *APK) installPackage(pkg *repository.RepositoryPackage, sourceDateEpoch 
 	}
 
 	// install the apk file
-	ra := readahead.NewReader(r)
-	defer ra.Close()
-	expanded, err := ExpandApk(ra)
+	expanded, err := ExpandApk(r)
 	if err != nil {
 		return fmt.Errorf("unable to expand apk for package %s: %w", pkg.Name, err)
 	}
