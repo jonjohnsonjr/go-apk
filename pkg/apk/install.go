@@ -17,7 +17,7 @@ package apk
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
+	"context"
 	"crypto/sha1" //nolint:gosec // this is what apk tools is using
 	"encoding/base64"
 	"errors"
@@ -25,6 +25,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // writeOneFile writes one file from the APK given the tar header and tar reader.
@@ -64,7 +66,10 @@ func (a *APK) writeOneFile(header *tar.Header, r io.Reader, allowOverwrite bool)
 // installAPKFiles install the files from the APK and return the list of installed files
 // and their permissions. Returns a tar.Header because it is a convenient existing
 // struct that has all of the fields we need.
-func (a *APK) installAPKFiles(gzipIn io.Reader, origin, replaces string) ([]tar.Header, error) { //nolint:gocyclo
+func (a *APK) installAPKFiles(ctx context.Context, gzipIn io.Reader, origin, replaces string) ([]tar.Header, error) { //nolint:gocyclo
+	// ctx, span := otel.Tracer("").Start(ctx, "installAPKFiles")
+	// defer span.End()
+
 	var files []tar.Header
 	gr, err := gzip.NewReader(gzipIn)
 	if err != nil {
@@ -163,7 +168,7 @@ func (a *APK) installAPKFiles(gzipIn io.Reader, origin, replaces string) ([]tar.
 				// compare the origin of the package that we are installing now, to the origin of the package
 				// that provided the file. If the origins are the same, then we can allow the
 				// overwrite. Otherwise, we need to return an error.
-				installed, err := a.GetInstalled()
+				installed, err := a.GetInstalled(ctx)
 				if err != nil {
 					return nil, fmt.Errorf("unable to get list of installed packages and files: %w", err)
 				}

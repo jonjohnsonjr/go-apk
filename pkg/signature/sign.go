@@ -17,7 +17,6 @@ package signature
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"crypto/sha1" //nolint:gosec
 	"errors"
 	"fmt"
@@ -25,6 +24,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/klauspost/compress/gzip"
 
 	"github.com/psanford/memfs"
 

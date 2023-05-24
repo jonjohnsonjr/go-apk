@@ -17,7 +17,7 @@ package apk
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +28,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/klauspost/compress/gzip"
+
 	sign "github.com/chainguard-dev/go-apk/pkg/signature"
 	"gitlab.alpinelinux.org/alpine/go/repository"
 	"go.lsp.dev/uri"
@@ -37,7 +39,7 @@ import (
 // The signatures for each index are verified unless ignoreSignatures is set to true.
 // The key-value pairs in the map for `keys` are the name of the key and the contents of the key.
 // The name is just indicative. If it finds a match, it will use it. Else, it will try all keys.
-func GetRepositoryIndexes(repos []string, keys map[string][]byte, arch string, options ...IndexOption) (indexes []NamedIndex, err error) { //nolint:gocyclo
+func GetRepositoryIndexes(ctx context.Context, repos []string, keys map[string][]byte, arch string, options ...IndexOption) (indexes []NamedIndex, err error) { //nolint:gocyclo
 	opts := &indexOpts{}
 	for _, opt := range options {
 		opt(opts)
@@ -94,7 +96,11 @@ func GetRepositoryIndexes(repos []string, keys map[string][]byte, arch string, o
 			if client == nil {
 				client = &http.Client{}
 			}
-			res, err := client.Get(asURL.String())
+			req, err := http.NewRequestWithContext(ctx, "GET", asURL.String(), nil)
+			if err != nil {
+				return nil, err
+			}
+			res, err := client.Do(req)
 			if err != nil {
 				return nil, fmt.Errorf("unable to get repository index at %s: %w", u, err)
 			}

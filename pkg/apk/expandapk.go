@@ -8,13 +8,16 @@ package apk
 
 import (
 	"archive/tar"
-	"compress/gzip"
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // The length of a gzip header
@@ -63,6 +66,7 @@ type expandApkWriter struct {
 	streamId   int
 	maxStreams int
 	f          *os.File
+	buf        *bufio.Writer
 }
 
 func newExpandApkWriter(parentDir string, baseName string, ext string) (*expandApkWriter, error) {
@@ -80,7 +84,7 @@ func newExpandApkWriter(parentDir string, baseName string, ext string) (*expandA
 }
 
 func (sw *expandApkWriter) Write(p []byte) (int, error) {
-	i, err := sw.f.Write(p)
+	i, err := sw.buf.Write(p)
 	if err != nil {
 		err = fmt.Errorf("expandApkWriter.Write: %w", err)
 	}
@@ -129,6 +133,11 @@ func (w *expandApkWriter) Next() error {
 		return fmt.Errorf("expandApkWriter.Next error 5: %w", err)
 	}
 	w.f = file
+	if w.buf == nil {
+		w.buf = bufio.NewWriterSize(w.f, 1<<15)
+	} else {
+		w.buf.Reset(w.f)
+	}
 
 	// At this point, we should have created the final tar.gz file,
 	// so inform the consumer of this method to speed up the read
@@ -145,7 +154,7 @@ func (w expandApkWriter) CurrentName() string {
 }
 
 func (w expandApkWriter) CloseFile() error {
-	return w.f.Close()
+	return errors.Join(w.buf.Flush(), w.f.Close())
 }
 
 // An implementation of io.Reader designed specifically for use in the expandApk() method.
@@ -196,7 +205,10 @@ func (r *expandApkReader) EnableFastRead() {
 //
 // Returns an APKExpanded struct containing references to the file. You *must* call APKExpanded.Close()
 // when finished to clean up the various files.
-func ExpandApk(source io.Reader) (*APKExpanded, error) {
+func ExpandApk(ctx context.Context, source io.Reader) (*APKExpanded, error) {
+	// ctx, span := otel.Tracer("").Start(ctx, "ExpandApk")
+	// defer span.End()
+
 	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return nil, err
