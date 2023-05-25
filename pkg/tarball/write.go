@@ -24,6 +24,7 @@ import (
 	"os"
 	"syscall"
 
+	gzip "golang.org/x/build/pargzip"
 	"golang.org/x/sys/unix"
 
 	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
@@ -264,6 +265,13 @@ func (ctx *Context) writeTar(tw *tar.Writer, fsys fs.FS, users, groups map[int]s
 // To override permissions, set the OverridePerms when creating the Context.
 // If you need to get multiple filesystems, merge them prior to calling WriteArchive.
 func (ctx *Context) WriteArchive(dst io.Writer, src fs.FS) error {
+	gzw := gzip.NewWriter(dst)
+	defer gzw.Close()
+
+	return ctx.WriteTar(gzw, src)
+}
+
+func (ctx *Context) WriteTar(dst io.Writer, src fs.FS) error {
 	tw := tar.NewWriter(dst)
 	if !ctx.SkipClose {
 		defer tw.Close()
