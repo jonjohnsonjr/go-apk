@@ -17,6 +17,7 @@ package apk
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -664,4 +665,193 @@ func packageRefs(pkgs []*repository.RepositoryPackage) []string {
 		names[i] = fmt.Sprintf("%s (%s) %s", pkg.Name, pkg.Version, pkg.Url())
 	}
 	return names
+}
+
+func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.RepositoryPackage, sourceDateEpoch *time.Time) error {
+	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
+
+	u := pkg.Url()
+
+	// Normalize the repo as a URI, so that local paths
+	// are translated into file:// URLs, allowing them to be parsed
+	// into a url.URL{}.
+	var (
+		r     io.Reader
+		asURI uri.URI
+	)
+	if strings.HasPrefix(u, "https://") {
+		asURI, _ = uri.Parse(u)
+	} else {
+		asURI = uri.New(u)
+	}
+	asURL, err := url.Parse(string(asURI))
+	if err != nil {
+		return fmt.Errorf("failed to parse package as URI: %w", err)
+	}
+
+	switch asURL.Scheme {
+	case "file":
+		f, err := os.Open(u)
+		if err != nil {
+			return fmt.Errorf("failed to read repository package apk %s: %w", u, err)
+		}
+		defer f.Close()
+		r = f
+	case "https":
+		client := a.client
+		if client == nil {
+			client = &http.Client{}
+		}
+		if a.cache != nil {
+			client = a.cache.client(client, false)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return err
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("unable to get package apk at %s: %w", u, err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			return fmt.Errorf("unable to get package apk at %s: %v", u, res.Status)
+		}
+		r = res.Body
+	default:
+		return fmt.Errorf("repository scheme %s not supported", asURL.Scheme)
+	}
+
+	// install the apk file
+	expanded, err := ExpandApk(r)
+	if err != nil {
+		return fmt.Errorf("unable to expand apk for package %s: %w", pkg.Name, err)
+	}
+	defer expanded.Close()
+	installedFiles, err := a.appendAPK(ctx, w, expanded.PackageData)
+	if err != nil {
+		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
+	}
+
+	// update the scripts.tar
+	controlData := bytes.NewReader(expanded.ControlData)
+
+	if err := a.updateScriptsTar(pkg.Package, controlData, sourceDateEpoch); err != nil {
+		return fmt.Errorf("unable to update scripts.tar for pkg %s: %w", pkg.Name, err)
+	}
+
+	// update the triggers
+	if _, err := controlData.Seek(0, 0); err != nil {
+		return fmt.Errorf("unable to seek to start of control data for pkg %s: %w", pkg.Name, err)
+	}
+	if err := a.updateTriggers(pkg.Package, controlData); err != nil {
+		return fmt.Errorf("unable to update triggers for pkg %s: %w", pkg.Name, err)
+	}
+
+	// update the installed file
+	if err := a.addInstalledPackage(pkg.Package, installedFiles); err != nil {
+		return fmt.Errorf("unable to update installed file for pkg %s: %w", pkg.Name, err)
+	}
+	return nil
+}
+
+func (a *APK) Combine(ctx context.Context, sourceDateEpoch *time.Time) error {
+	w, err := os.CreateTemp("", "")
+	if err != nil {
+		return err
+	}
+
+	a.logger.Printf("created file to combine: ", w.Name())
+
+	allpkgs, conflicts, err := a.ResolveWorld(ctx)
+	if err != nil {
+		return fmt.Errorf("error getting package dependencies: %w", err)
+	}
+
+	// 3. For each name on the list:
+	//     a. Check if it is installed, if so, skip
+	//     b. Get the .apk file
+	//     c. Install the .apk file
+	//     d. Update /lib/apk/db/scripts.tar
+	//     d. Update /lib/apk/db/triggers
+	//     e. Update the installed file
+	dir, err := os.MkdirTemp("", "go-apk")
+	if err != nil {
+		return fmt.Errorf("could not make temp dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	for _, pkg := range conflicts {
+		isInstalled, err := a.isInstalledPackage(pkg)
+		if err != nil {
+			return fmt.Errorf("error checking if package %s is installed: %w", pkg, err)
+		}
+		if isInstalled {
+			return fmt.Errorf("cannot install due to conflict with %s", pkg)
+		}
+	}
+	for _, pkg := range allpkgs {
+		isInstalled, err := a.isInstalledPackage(pkg.Name)
+		if err != nil {
+			return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
+		}
+		if isInstalled {
+			continue
+		}
+		// get the apk file
+		if err := a.appendPackage(ctx, w, pkg, sourceDateEpoch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TODO(jonjohnsonjr): This is serial currently, but we just need a writerAt to fix that.
+// TODO(jonjohnsonjr): This may need to handle file conflicts.
+// TODO(jonjohnsonjr): We may need to truncate gzipIn prior to tar EOF, but we can do that in melange.
+func (a *APK) appendAPK(ctx context.Context, w io.Writer, gzipIn io.Reader) ([]tar.Header, error) {
+	tee := io.TeeReader(gzipIn, w)
+	gr, err := gzip.NewReader(tee)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(jonjohnsonjr): Do we need to handle APKv1.0 compatibility?
+	// per https://git.alpinelinux.org/apk-tools/tree/src/extract_v2.c?id=337734941831dae9a6aa441e38611c43a5fd72c0#n120
+	//  * APKv1.0 compatibility - first non-hidden file is
+	//  * considered to start the data section of the file.
+	//  * This does not make any sense if the file has v2.0
+	//  * style .PKGINFO
+
+	var files []tar.Header
+	tr := tar.NewReader(gr)
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		// TODO(jonjohnsonjr): Check for conflicts here?
+		files = append(files, *header)
+	}
+
+	return files, nil
+}
+
+func (a *APK) appendMetadata(ctx context.Context, w io.Writer, sourceDateEpoch *time.Time) error {
+	for _, fn := range []string{
+		scriptsFilePath,
+		triggersFilePath,
+		installedFilePath,
+	} {
+		f, err := a.fs.OpenFile(fn, os.O_RDONLY, 0)
+		if err != nil {
+			return fmt.Errorf("unable to open %q: %w", fn, err)
+		}
+		defer f.Close()
+	}
+
+	return nil
 }
