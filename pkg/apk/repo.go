@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"gitlab.alpinelinux.org/alpine/go/repository"
+	"go.opentelemetry.io/otel"
 )
 
 // NamedIndex an index that contains all of its packages,
@@ -83,7 +84,10 @@ type repositoryPackage struct {
 
 // SetRepositories sets the contents of /etc/apk/repositories file.
 // The base directory of /etc/apk must already exist, i.e. this only works on an initialized APK database.
-func (a *APK) SetRepositories(repos []string) error {
+func (a *APK) SetRepositories(ctx context.Context, repos []string) error {
+	ctx, span := otel.Tracer("apko").Start(ctx, "SetRepositories")
+	defer span.End()
+
 	a.logger.Infof("setting apk repositories")
 
 	if len(repos) == 0 {

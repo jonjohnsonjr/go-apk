@@ -15,11 +15,14 @@
 package apk
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"go.opentelemetry.io/otel"
 )
 
 // getWorldPackages get list of packages that should be installed, according to /etc/apk/world
@@ -38,7 +41,10 @@ func (a *APK) GetWorld() ([]string, error) {
 
 // SetWorld sets the list of world packages intended to be installed.
 // The base directory of /etc/apk must already exist, i.e. this only works on an initialized APK database.
-func (a *APK) SetWorld(packages []string) error {
+func (a *APK) SetWorld(ctx context.Context, packages []string) error {
+	ctx, span := otel.Tracer("apko").Start(ctx, "SetWorld")
+	defer span.End()
+
 	a.logger.Infof("setting apk world")
 
 	// sort them before writing

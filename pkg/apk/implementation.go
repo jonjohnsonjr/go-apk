@@ -33,6 +33,7 @@ import (
 
 	"gitlab.alpinelinux.org/alpine/go/pkg/repository"
 	"go.lsp.dev/uri"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 
@@ -88,7 +89,8 @@ type deviceFile struct {
 }
 
 var baseDirectories = []directory{
-	{"/tmp", 0o777 | fs.ModeSticky},
+	//{"/tmp", 0o777 | fs.ModeSticky},
+	{"tmp", 0o777},
 	{"/dev", 0o755},
 	{"/etc", 0o755},
 	{"/lib", 0o755},
@@ -222,7 +224,8 @@ func (a *APK) InitDB(ctx context.Context, versions ...string) error {
 		case !stat.IsDir():
 			return fmt.Errorf("base directory %s is not a directory", e.path)
 		case stat.Mode().Perm() != e.perms:
-			return fmt.Errorf("base directory %s has incorrect permissions: %o", e.path, stat.Mode().Perm())
+			got, want := stat.Mode().Perm(), e.perms
+			return fmt.Errorf("base directory %s has incorrect permissions: got %o want %o ", e.path, got, want)
 		}
 	}
 	for _, e := range initDirectories {
@@ -321,6 +324,8 @@ func (a *APK) loadSystemKeyring(locations ...string) ([]string, error) {
 // Installs the specified keys into the APK keyring inside the build context.
 func (a *APK) InitKeyring(ctx context.Context, keyFiles, extraKeyFiles []string) (err error) {
 	a.logger.Infof("initializing apk keyring")
+	ctx, span := otel.Tracer("apko").Start(ctx, "InitKeyring")
+	defer span.End()
 
 	if err := a.fs.MkdirAll(DefaultKeyRingPath, 0o755); err != nil {
 		return fmt.Errorf("failed to make keys dir: %w", err)
@@ -336,6 +341,8 @@ func (a *APK) InitKeyring(ctx context.Context, keyFiles, extraKeyFiles []string)
 	for _, element := range keyFiles {
 		element := element
 		eg.Go(func() error {
+			ctx, span := otel.Tracer("apko").Start(ctx, fmt.Sprintf("InitKeyring(%q)", element))
+			defer span.End()
 			a.logger.Debugf("installing key %v", element)
 
 			// Normalize the element as a URI, so that local paths
@@ -401,6 +408,9 @@ func (a *APK) InitKeyring(ctx context.Context, keyFiles, extraKeyFiles []string)
 
 // ResolveWorld determine the target state for the requested dependencies in /etc/apk/world. Do not install anything.
 func (a *APK) ResolveWorld(ctx context.Context) (toInstall []*repository.RepositoryPackage, conflicts []string, err error) {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "ResolveWorld")
+	defer span.End()
+
 	a.logger.Infof("determining desired apk world")
 
 	// to fix the world, we need to:
@@ -428,6 +438,9 @@ func (a *APK) ResolveWorld(ctx context.Context) (toInstall []*repository.Reposit
 
 // FixateWorld force apk's resolver to re-resolve the requested dependencies in /etc/apk/world.
 func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error {
+	ctx, span := otel.Tracer("apko").Start(ctx, "FixateWorld")
+	defer span.End()
+
 	/*
 		equivalent of: "apk fix --arch arch --root root"
 		with possible options for --no-scripts, --no-cache, --update-cache
@@ -497,6 +510,8 @@ func (e *NoKeysFoundError) Error() string {
 
 // fetchAlpineKeys fetches the public keys for the repositories in the APK database.
 func (a *APK) fetchAlpineKeys(ctx context.Context, versions []string) error {
+	ctx, span := otel.Tracer("apko").Start(ctx, "fetchAlpineKeys")
+	defer span.End()
 	u := alpineReleasesURL
 	client := a.client
 	if client == nil {
@@ -627,7 +642,7 @@ func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPack
 	}
 
 	// install the apk file
-	expanded, err := ExpandApk(r)
+	expanded, err := ExpandApk(ctx, r)
 	if err != nil {
 		return fmt.Errorf("unable to expand apk for package %s: %w", pkg.Name, err)
 	}
@@ -668,6 +683,9 @@ func packageRefs(pkgs []*repository.RepositoryPackage) []string {
 }
 
 func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.RepositoryPackage, sourceDateEpoch *time.Time) error {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendPackage")
+	defer span.End()
+
 	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
 
 	u := pkg.Url()
@@ -691,6 +709,7 @@ func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.Re
 
 	switch asURL.Scheme {
 	case "file":
+		// a.logger.Printf("opening %s", u)
 		f, err := os.Open(u)
 		if err != nil {
 			return fmt.Errorf("failed to read repository package apk %s: %w", u, err)
@@ -705,6 +724,8 @@ func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.Re
 		if a.cache != nil {
 			client = a.cache.client(client, false)
 		}
+		a.logger.Printf("fetching %s", u)
+		ctx, span := otel.Tracer("go-apk").Start(ctx, "fetchPackage")
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return err
@@ -718,12 +739,13 @@ func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.Re
 			return fmt.Errorf("unable to get package apk at %s: %v", u, res.Status)
 		}
 		r = res.Body
+		span.End()
 	default:
 		return fmt.Errorf("repository scheme %s not supported", asURL.Scheme)
 	}
 
 	// install the apk file
-	expanded, err := ExpandApk(r)
+	expanded, err := ExpandApk(ctx, r)
 	if err != nil {
 		return fmt.Errorf("unable to expand apk for package %s: %w", pkg.Name, err)
 	}
@@ -732,6 +754,8 @@ func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.Re
 	if err != nil {
 		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
 	}
+
+	a.logger.Printf("installed files: %d", len(installedFiles))
 
 	// update the scripts.tar
 	controlData := bytes.NewReader(expanded.ControlData)
@@ -756,52 +780,81 @@ func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.Re
 }
 
 func (a *APK) Combine(ctx context.Context, sourceDateEpoch *time.Time) error {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "Combine")
+	defer span.End()
+
+	start := time.Now()
+	defer func() {
+		a.logger.Printf("Combine() took %s", time.Since(start))
+	}()
 	w, err := os.CreateTemp("", "")
 	if err != nil {
 		return err
 	}
 
-	a.logger.Printf("created file to combine: ", w.Name())
+	a.logger.Printf("created file to combine: %s", w.Name())
 
-	allpkgs, conflicts, err := a.ResolveWorld(ctx)
+	// TODO: Conflicts
+	allpkgs, _, err := a.ResolveWorld(ctx)
 	if err != nil {
 		return fmt.Errorf("error getting package dependencies: %w", err)
 	}
 
-	// 3. For each name on the list:
-	//     a. Check if it is installed, if so, skip
-	//     b. Get the .apk file
-	//     c. Install the .apk file
-	//     d. Update /lib/apk/db/scripts.tar
-	//     d. Update /lib/apk/db/triggers
-	//     e. Update the installed file
-	dir, err := os.MkdirTemp("", "go-apk")
-	if err != nil {
-		return fmt.Errorf("could not make temp dir: %w", err)
-	}
-	defer os.RemoveAll(dir)
-	for _, pkg := range conflicts {
-		isInstalled, err := a.isInstalledPackage(pkg)
-		if err != nil {
-			return fmt.Errorf("error checking if package %s is installed: %w", pkg, err)
-		}
-		if isInstalled {
-			return fmt.Errorf("cannot install due to conflict with %s", pkg)
-		}
-	}
 	for _, pkg := range allpkgs {
-		isInstalled, err := a.isInstalledPackage(pkg.Name)
-		if err != nil {
-			return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
-		}
-		if isInstalled {
-			continue
-		}
+		a.logger.Printf("appending %s", pkg.Filename())
+		// isInstalled, err := a.isInstalledPackage(pkg.Name)
+		// if err != nil {
+		// 	return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
+		// }
+		// if isInstalled {
+		// 	continue
+		// }
 		// get the apk file
 		if err := a.appendPackage(ctx, w, pkg, sourceDateEpoch); err != nil {
 			return err
 		}
 	}
+
+	if err := a.appendMetadata(ctx, w, sourceDateEpoch); err != nil {
+		return err
+	}
+
+	// TODO: The rest of the owl.
+
+	// if err := di.MutateAccounts(fsys, o, ic); err != nil {
+	// 	return fmt.Errorf("failed to mutate accounts: %w", err)
+	// }
+
+	// if err := di.MutatePaths(fsys, o, ic); err != nil {
+	// 	return fmt.Errorf("failed to mutate paths: %w", err)
+	// }
+
+	// if err := di.GenerateOSRelease(fsys, o, ic); err != nil {
+	// 	if errors.Is(err, ErrOSReleaseAlreadyPresent) {
+	// 		o.Logger().Warnf("did not generate /etc/os-release: %v", err)
+	// 	} else {
+	// 		return fmt.Errorf("failed to generate /etc/os-release: %w", err)
+	// 	}
+	// }
+
+	// if err := di.WriteSupervisionTree(s6context, ic); err != nil {
+	// 	return fmt.Errorf("failed to write supervision tree: %w", err)
+	// }
+
+	// // add busybox symlinks
+	// if err := di.InstallBusyboxLinks(fsys, o); err != nil {
+	// 	return err
+	// }
+
+	// // add ldconfig links
+	// if err := di.InstallLdconfigLinks(fsys); err != nil {
+	// 	return err
+	// }
+
+	// // add necessary character devices
+	// if err := di.InstallCharDevices(fsys); err != nil {
+	// 	return err
+	// }
 	return nil
 }
 
@@ -809,10 +862,13 @@ func (a *APK) Combine(ctx context.Context, sourceDateEpoch *time.Time) error {
 // TODO(jonjohnsonjr): This may need to handle file conflicts.
 // TODO(jonjohnsonjr): We may need to truncate gzipIn prior to tar EOF, but we can do that in melange.
 func (a *APK) appendAPK(ctx context.Context, w io.Writer, gzipIn io.Reader) ([]tar.Header, error) {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendAPK")
+	defer span.End()
+
 	tee := io.TeeReader(gzipIn, w)
 	gr, err := gzip.NewReader(tee)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gzip.NewReader: %w", err)
 	}
 
 	// TODO(jonjohnsonjr): Do we need to handle APKv1.0 compatibility?
@@ -830,8 +886,10 @@ func (a *APK) appendAPK(ctx context.Context, w io.Writer, gzipIn io.Reader) ([]t
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("tr.Next(): %w", err)
 		}
+
+		// a.logger.Printf("saw tar file %s", header.Name)
 
 		// TODO(jonjohnsonjr): Check for conflicts here?
 		files = append(files, *header)
@@ -841,6 +899,9 @@ func (a *APK) appendAPK(ctx context.Context, w io.Writer, gzipIn io.Reader) ([]t
 }
 
 func (a *APK) appendMetadata(ctx context.Context, w io.Writer, sourceDateEpoch *time.Time) error {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendMetadata")
+	defer span.End()
+
 	for _, fn := range []string{
 		scriptsFilePath,
 		triggersFilePath,
