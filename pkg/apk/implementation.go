@@ -17,7 +17,6 @@ package apk
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -589,57 +588,11 @@ func (a *APK) fetchAlpineKeys(ctx context.Context, versions []string) error {
 func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPackage, sourceDateEpoch *time.Time) error {
 	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
 
-	u := pkg.Url()
-
-	// Normalize the repo as a URI, so that local paths
-	// are translated into file:// URLs, allowing them to be parsed
-	// into a url.URL{}.
-	var (
-		r     io.Reader
-		asURI uri.URI
-	)
-	if strings.HasPrefix(u, "https://") {
-		asURI, _ = uri.Parse(u)
-	} else {
-		asURI = uri.New(u)
-	}
-	asURL, err := url.Parse(string(asURI))
+	r, err := a.fetchPackage(ctx, pkg)
 	if err != nil {
-		return fmt.Errorf("failed to parse package as URI: %w", err)
+		return err
 	}
-
-	switch asURL.Scheme {
-	case "file":
-		f, err := os.Open(u)
-		if err != nil {
-			return fmt.Errorf("failed to read repository package apk %s: %w", u, err)
-		}
-		defer f.Close()
-		r = f
-	case "https":
-		client := a.client
-		if client == nil {
-			client = &http.Client{}
-		}
-		if a.cache != nil {
-			client = a.cache.client(client, false)
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return err
-		}
-		res, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("unable to get package apk at %s: %w", u, err)
-		}
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf("unable to get package apk at %s: %v", u, res.Status)
-		}
-		r = res.Body
-	default:
-		return fmt.Errorf("repository scheme %s not supported", asURL.Scheme)
-	}
+	defer r.Close()
 
 	// install the apk file
 	expanded, err := ExpandApk(ctx, r)
@@ -682,40 +635,34 @@ func packageRefs(pkgs []*repository.RepositoryPackage) []string {
 	return names
 }
 
-func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.RepositoryPackage, sourceDateEpoch *time.Time) error {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendPackage")
+// Normalize the repo as a URI, so that local paths
+// are translated into file:// URLs, allowing them to be parsed
+// into a url.URL{}.
+func (a *APK) url(u string) (*url.URL, error) {
+	if !strings.HasPrefix(u, "https://") {
+		return url.Parse(string(uri.New(u)))
+	}
+	asURI, err := uri.Parse(u)
+	if err != nil {
+		return nil, fmt.Errorf("parsing uri %q: %w", u, err)
+	}
+
+	return url.Parse(string(asURI))
+}
+
+func (a *APK) fetchPackage(ctx context.Context, pkg *repository.RepositoryPackage) (io.ReadCloser, error) {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "fetchPackage")
 	defer span.End()
 
-	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
-
 	u := pkg.Url()
-
-	// Normalize the repo as a URI, so that local paths
-	// are translated into file:// URLs, allowing them to be parsed
-	// into a url.URL{}.
-	var (
-		r     io.Reader
-		asURI uri.URI
-	)
-	if strings.HasPrefix(u, "https://") {
-		asURI, _ = uri.Parse(u)
-	} else {
-		asURI = uri.New(u)
-	}
-	asURL, err := url.Parse(string(asURI))
+	asURL, err := a.url(u)
 	if err != nil {
-		return fmt.Errorf("failed to parse package as URI: %w", err)
+		return nil, fmt.Errorf("parsing %q: %w", u, err)
 	}
 
 	switch asURL.Scheme {
 	case "file":
-		// a.logger.Printf("opening %s", u)
-		f, err := os.Open(u)
-		if err != nil {
-			return fmt.Errorf("failed to read repository package apk %s: %w", u, err)
-		}
-		defer f.Close()
-		r = f
+		return os.Open(u)
 	case "https":
 		client := a.client
 		if client == nil {
@@ -724,195 +671,20 @@ func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.Re
 		if a.cache != nil {
 			client = a.cache.client(client, false)
 		}
-		a.logger.Printf("fetching %s", u)
-		ctx, span := otel.Tracer("go-apk").Start(ctx, "fetchPackage")
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		res, err := client.Do(req)
 		if err != nil {
-			return fmt.Errorf("unable to get package apk at %s: %w", u, err)
+			return nil, fmt.Errorf("unable to get package apk at %s: %w", u, err)
 		}
-		defer res.Body.Close()
 		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf("unable to get package apk at %s: %v", u, res.Status)
+			defer res.Body.Close()
+			return nil, fmt.Errorf("unable to get package apk at %s: %v", u, res.Status)
 		}
-		r = res.Body
-		span.End()
-	default:
-		return fmt.Errorf("repository scheme %s not supported", asURL.Scheme)
+		return res.Body, nil
 	}
 
-	// install the apk file
-	expanded, err := ExpandApk(ctx, r)
-	if err != nil {
-		return fmt.Errorf("unable to expand apk for package %s: %w", pkg.Name, err)
-	}
-	defer expanded.Close()
-	installedFiles, err := a.appendAPK(ctx, w, expanded.PackageData)
-	if err != nil {
-		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
-	}
-
-	a.logger.Printf("installed files: %d", len(installedFiles))
-
-	// update the scripts.tar
-	controlData := bytes.NewReader(expanded.ControlData)
-
-	if err := a.updateScriptsTar(pkg.Package, controlData, sourceDateEpoch); err != nil {
-		return fmt.Errorf("unable to update scripts.tar for pkg %s: %w", pkg.Name, err)
-	}
-
-	// update the triggers
-	if _, err := controlData.Seek(0, 0); err != nil {
-		return fmt.Errorf("unable to seek to start of control data for pkg %s: %w", pkg.Name, err)
-	}
-	if err := a.updateTriggers(pkg.Package, controlData); err != nil {
-		return fmt.Errorf("unable to update triggers for pkg %s: %w", pkg.Name, err)
-	}
-
-	// update the installed file
-	if err := a.addInstalledPackage(pkg.Package, installedFiles); err != nil {
-		return fmt.Errorf("unable to update installed file for pkg %s: %w", pkg.Name, err)
-	}
-	return nil
-}
-
-func (a *APK) Combine(ctx context.Context, sourceDateEpoch *time.Time) error {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "Combine")
-	defer span.End()
-
-	start := time.Now()
-	defer func() {
-		a.logger.Printf("Combine() took %s", time.Since(start))
-	}()
-	w, err := os.CreateTemp("", "")
-	if err != nil {
-		return err
-	}
-
-	a.logger.Printf("created file to combine: %s", w.Name())
-
-	// TODO: Conflicts
-	allpkgs, _, err := a.ResolveWorld(ctx)
-	if err != nil {
-		return fmt.Errorf("error getting package dependencies: %w", err)
-	}
-
-	for _, pkg := range allpkgs {
-		a.logger.Printf("appending %s", pkg.Filename())
-		// isInstalled, err := a.isInstalledPackage(pkg.Name)
-		// if err != nil {
-		// 	return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
-		// }
-		// if isInstalled {
-		// 	continue
-		// }
-		// get the apk file
-		if err := a.appendPackage(ctx, w, pkg, sourceDateEpoch); err != nil {
-			return err
-		}
-	}
-
-	if err := a.appendMetadata(ctx, w, sourceDateEpoch); err != nil {
-		return err
-	}
-
-	// TODO: The rest of the owl.
-
-	// if err := di.MutateAccounts(fsys, o, ic); err != nil {
-	// 	return fmt.Errorf("failed to mutate accounts: %w", err)
-	// }
-
-	// if err := di.MutatePaths(fsys, o, ic); err != nil {
-	// 	return fmt.Errorf("failed to mutate paths: %w", err)
-	// }
-
-	// if err := di.GenerateOSRelease(fsys, o, ic); err != nil {
-	// 	if errors.Is(err, ErrOSReleaseAlreadyPresent) {
-	// 		o.Logger().Warnf("did not generate /etc/os-release: %v", err)
-	// 	} else {
-	// 		return fmt.Errorf("failed to generate /etc/os-release: %w", err)
-	// 	}
-	// }
-
-	// if err := di.WriteSupervisionTree(s6context, ic); err != nil {
-	// 	return fmt.Errorf("failed to write supervision tree: %w", err)
-	// }
-
-	// // add busybox symlinks
-	// if err := di.InstallBusyboxLinks(fsys, o); err != nil {
-	// 	return err
-	// }
-
-	// // add ldconfig links
-	// if err := di.InstallLdconfigLinks(fsys); err != nil {
-	// 	return err
-	// }
-
-	// // add necessary character devices
-	// if err := di.InstallCharDevices(fsys); err != nil {
-	// 	return err
-	// }
-	return nil
-}
-
-// TODO(jonjohnsonjr): This is serial currently, but we just need a writerAt to fix that.
-// TODO(jonjohnsonjr): This may need to handle file conflicts.
-// TODO(jonjohnsonjr): We may need to truncate gzipIn prior to tar EOF, but we can do that in melange.
-func (a *APK) appendAPK(ctx context.Context, w io.Writer, gzipIn io.Reader) ([]tar.Header, error) {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendAPK")
-	defer span.End()
-
-	tee := io.TeeReader(gzipIn, w)
-	gr, err := gzip.NewReader(tee)
-	if err != nil {
-		return nil, fmt.Errorf("gzip.NewReader: %w", err)
-	}
-
-	// TODO(jonjohnsonjr): Do we need to handle APKv1.0 compatibility?
-	// per https://git.alpinelinux.org/apk-tools/tree/src/extract_v2.c?id=337734941831dae9a6aa441e38611c43a5fd72c0#n120
-	//  * APKv1.0 compatibility - first non-hidden file is
-	//  * considered to start the data section of the file.
-	//  * This does not make any sense if the file has v2.0
-	//  * style .PKGINFO
-
-	var files []tar.Header
-	tr := tar.NewReader(gr)
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("tr.Next(): %w", err)
-		}
-
-		// a.logger.Printf("saw tar file %s", header.Name)
-
-		// TODO(jonjohnsonjr): Check for conflicts here?
-		files = append(files, *header)
-	}
-
-	return files, nil
-}
-
-func (a *APK) appendMetadata(ctx context.Context, w io.Writer, sourceDateEpoch *time.Time) error {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendMetadata")
-	defer span.End()
-
-	for _, fn := range []string{
-		scriptsFilePath,
-		triggersFilePath,
-		installedFilePath,
-	} {
-		f, err := a.fs.OpenFile(fn, os.O_RDONLY, 0)
-		if err != nil {
-			return fmt.Errorf("unable to open %q: %w", fn, err)
-		}
-		defer f.Close()
-	}
-
-	return nil
+	return nil, fmt.Errorf("repository scheme %s not supported", asURL.Scheme)
 }

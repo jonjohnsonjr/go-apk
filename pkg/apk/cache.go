@@ -52,7 +52,7 @@ func (t *cacheTransport) RoundTrip(request *http.Request) (*http.Response, error
 	if request.URL == nil {
 		return nil, fmt.Errorf("no URL in request")
 	}
-	cacheFile, err := t.cachePathFromURL(*request.URL)
+	cacheFile, err := t.cachePathFromURL(request.URL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid cache path based on URL: %w", err)
 	}
@@ -140,7 +140,11 @@ func (t *cacheTransport) retrieveAndSaveFile(cacheFile, etagFile string, request
 }
 
 // cachePathFromURL given a URL, figure out what the cache path would be
-func (t *cacheTransport) cachePathFromURL(u url.URL) (string, error) {
+func (t *cacheTransport) cachePathFromURL(u *url.URL) (string, error) {
+	return cachePathFromURL(t.root, u)
+}
+
+func cachePathFromURL(root string, u *url.URL) (string, error) {
 	// the last two levels are what we append. For example https://example.com/foo/bar/x86_64/baz.apk
 	// means we want to append x86_64/baz.apk to our cache root
 	u2 := u
@@ -156,12 +160,12 @@ func (t *cacheTransport) cachePathFromURL(u url.URL) (string, error) {
 
 	// url encode it so it can be a single directory
 	repoDir = url.QueryEscape(u2.String())
-	cacheFile := filepath.Join(t.root, repoDir, dir, filename)
+	cacheFile := filepath.Join(root, repoDir, dir, filename)
 	// validate it is within t.root
 	cacheFile = filepath.Clean(cacheFile)
-	root := filepath.Clean(t.root)
-	if !strings.HasPrefix(cacheFile, root) {
-		return "", fmt.Errorf("cache file %s is not within root %s", cacheFile, root)
+	cleanroot := filepath.Clean(root)
+	if !strings.HasPrefix(cacheFile, cleanroot) {
+		return "", fmt.Errorf("cache file %s is not within root %s", cacheFile, cleanroot)
 	}
 	return cacheFile, nil
 }
