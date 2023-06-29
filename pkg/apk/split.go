@@ -16,13 +16,13 @@ package apk
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"time"
+	"strings"
 
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/pgzip"
@@ -31,186 +31,78 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
-func (a *APK) Combine(ctx context.Context, w io.Writer, sourceDateEpoch *time.Time) error {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "Combine")
-	defer span.End()
-
-	start := time.Now()
-	defer func() {
-		a.logger.Printf("Combine() took %s", time.Since(start))
-	}()
-
-	allpkgs, conflicts, err := a.ResolveWorld(ctx)
-	if err != nil {
-		return fmt.Errorf("error getting package dependencies: %w", err)
-	}
-	if len(conflicts) != 0 {
-		return fmt.Errorf("conflicts: %v", conflicts)
-	}
-
-	for _, pkg := range allpkgs {
-		a.logger.Printf("appending %s", pkg.Filename())
-		// TODO(jonjohnsonjr): If we need to check this, we should make it not slow.
-
-		// isInstalled, err := a.isInstalledPackage(pkg.Name)
-		// if err != nil {
-		// 	return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
-		// }
-		// if isInstalled {
-		// 	continue
-		// }
-		// get the apk file
-		if err := a.appendPackage(ctx, w, pkg, sourceDateEpoch); err != nil {
-			return err
-		}
-	}
-
-	if err := a.appendMetadata(ctx, w, sourceDateEpoch); err != nil {
-		return err
-	}
-
-	// TODO: The rest of the owl.
-
-	// if err := di.MutateAccounts(fsys, o, ic); err != nil {
-	// 	return fmt.Errorf("failed to mutate accounts: %w", err)
-	// }
-
-	// if err := di.MutatePaths(fsys, o, ic); err != nil {
-	// 	return fmt.Errorf("failed to mutate paths: %w", err)
-	// }
-
-	// if err := di.GenerateOSRelease(fsys, o, ic); err != nil {
-	// 	if errors.Is(err, ErrOSReleaseAlreadyPresent) {
-	// 		o.Logger().Warnf("did not generate /etc/os-release: %v", err)
-	// 	} else {
-	// 		return fmt.Errorf("failed to generate /etc/os-release: %w", err)
-	// 	}
-	// }
-
-	// if err := di.WriteSupervisionTree(s6context, ic); err != nil {
-	// 	return fmt.Errorf("failed to write supervision tree: %w", err)
-	// }
-
-	// // add busybox symlinks
-	// if err := di.InstallBusyboxLinks(fsys, o); err != nil {
-	// 	return err
-	// }
-
-	// // add ldconfig links
-	// if err := di.InstallLdconfigLinks(fsys); err != nil {
-	// 	return err
-	// }
-
-	// // add necessary character devices
-	// if err := di.InstallCharDevices(fsys); err != nil {
-	// 	return err
-	// }
-
-	return nil
-}
-
-func (a *APK) appendPackage(ctx context.Context, w io.Writer, pkg *repository.RepositoryPackage, sourceDateEpoch *time.Time) error {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendPackage")
-	defer span.End()
-
-	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
-
-	r, err := a.fetchPackage(ctx, pkg)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	split, err := a.splitApk(ctx, pkg)
-	if err != nil {
-		return fmt.Errorf("splitApk: %w", err)
-	}
-
-	installedFiles := split.Files
-
-	compressed, err := split.Compressed()
-	if err != nil {
-		return err
-	}
-	defer compressed.Close()
-
-	if err := a.appendAPK(ctx, w, compressed); err != nil {
-		return fmt.Errorf("appendApk %q: %w", pkg.Name, err)
-	}
-
-	a.logger.Printf("installed files: %d", len(installedFiles))
-
-	// update the scripts.tar
-	controlData := bytes.NewReader(split.Control)
-
-	if err := a.updateScriptsTar(pkg.Package, controlData, sourceDateEpoch); err != nil {
-		return fmt.Errorf("unable to update scripts.tar for pkg %s: %w", pkg.Name, err)
-	}
-
-	// update the triggers
-	if _, err := controlData.Seek(0, 0); err != nil {
-		return fmt.Errorf("unable to seek to start of control data for pkg %s: %w", pkg.Name, err)
-	}
-	if err := a.updateTriggers(pkg.Package, controlData); err != nil {
-		return fmt.Errorf("unable to update triggers for pkg %s: %w", pkg.Name, err)
-	}
-
-	// update the installed file
-	if err := a.addInstalledPackage(pkg.Package, installedFiles); err != nil {
-		return fmt.Errorf("unable to update installed file for pkg %s: %w", pkg.Name, err)
-	}
-	return nil
-}
-
-func (a *APK) appendMetadata(ctx context.Context, w io.Writer, sourceDateEpoch *time.Time) error {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "appendMetadata")
-	defer span.End()
-
-	for _, fn := range []string{
-		scriptsFilePath,
-		triggersFilePath,
-		installedFilePath,
-	} {
-		f, err := a.fs.OpenFile(fn, os.O_RDONLY, 0)
-		if err != nil {
-			return fmt.Errorf("unable to open %q: %w", fn, err)
-		}
-		defer f.Close()
-	}
-
-	return nil
-}
-
-type splitApk struct {
-	// Whether or not the apk contains a signature
-	// Note: currently unused
-	Signed bool
-
-	// The package signature (a.k.a. ".SIGN...") in tar.gz format
-	Signature []byte
-
-	// the control data (a.k.a. ".PKGINFO") in tar.gz format
-	Control []byte
-
-	Files []tar.Header
+type SplitApk struct {
+	signature string
+	control   string
+	installed string
+	scripts   string
+	triggers  string
 
 	// filenames for compressed and uncompressed data sections
 	compressed   string
 	uncompressed string
 }
 
-func (s *splitApk) Compressed() (io.ReadCloser, error) {
+func (s *SplitApk) Compressed() (io.ReadCloser, error) {
 	return os.Open(s.compressed)
 }
 
-func (s *splitApk) Uncompressed() (io.ReadCloser, error) {
+func (s *SplitApk) Uncompressed() (io.ReadCloser, error) {
 	return os.Open(s.uncompressed)
 }
 
+func (s *SplitApk) Control() (io.ReadSeekCloser, error) {
+	return os.Open(s.control)
+}
+
+func (s *SplitApk) Installed() (io.ReadSeekCloser, error) {
+	return os.Open(s.installed)
+}
+
+func (s *SplitApk) Scripts() (io.ReadSeekCloser, error) {
+	return os.Open(s.scripts)
+}
+
+func (s *SplitApk) Triggers() (io.ReadSeekCloser, error) {
+	return os.Open(s.triggers)
+}
+
 // forked from ExpandApk
-func (a *APK) splitApk(ctx context.Context, pkg *repository.RepositoryPackage) (*splitApk, error) {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "splitApk")
+func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (*SplitApk, error) {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "SplitApk")
 	defer span.End()
+
+	// TODO: Align with cache stuff.
+	if a.cache == nil {
+		return nil, fmt.Errorf("cache is nil")
+	}
+
+	u, err := a.url(pkg.Url())
+	if err != nil {
+		return nil, err
+	}
+
+	p, err := cachePathFromURL(a.cache.dir, u)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(jonjohnsonjr): Check to see if this already exists and skip it.
+	split := SplitApk{
+		uncompressed: p + ".tar",
+		compressed:   p + ".targz",
+		control:      p + ".control",
+		signature:    p + ".sig",
+		installed:    p + ".installed",
+		scripts:      p + ".scripts",
+		triggers:     p + ".triggers",
+	}
+
+	if _, err := split.Control(); err == nil {
+		return &split, nil
+	}
+
+	// Check to see if this stuff exists.
 
 	// TODO(jonjohnsonjr): Do we need to handle APKv1.0 compatibility?
 	// per https://git.alpinelinux.org/apk-tools/tree/src/extract_v2.c?id=337734941831dae9a6aa441e38611c43a5fd72c0#n120
@@ -236,8 +128,8 @@ func (a *APK) splitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 		return nil, fmt.Errorf("expandApk error 1: %w", err)
 	}
 	exR := newExpandApkReader(source)
-	tr := io.TeeReader(exR, sw)
-	gzi, err := gzip.NewReader(tr)
+	tee := io.TeeReader(exR, sw)
+	gzi, err := gzip.NewReader(tee)
 	if err != nil {
 		return nil, fmt.Errorf("expandApk error 2: %w", err)
 	}
@@ -252,7 +144,7 @@ func (a *APK) splitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 			return nil, fmt.Errorf("expandApk error 3: %w", err)
 		}
 		gzipStreams = append(gzipStreams, sw.CurrentName())
-		if err := gzi.Reset(tr); err != nil {
+		if err := gzi.Reset(tee); err != nil {
 			if err == io.EOF {
 				break
 			} else {
@@ -338,48 +230,22 @@ func (a *APK) splitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 		return nil, fmt.Errorf("invalid number of tar streams: %d", numGzipStreams)
 	}
 
-	controlData, err := os.ReadFile(gzipStreams[controlDataIndex])
-	if err != nil {
-		return nil, fmt.Errorf("unable to read control data: %w", err)
+	if err := os.Rename(gzipStreams[controlDataIndex], split.control); err != nil {
+		return nil, fmt.Errorf("unable to rename control data: %w", err)
 	}
 
-	split := splitApk{
-		Signed:  signed,
-		Control: controlData,
-	}
 	if signed {
-		b, err := os.ReadFile(gzipStreams[0])
-		if err != nil {
-			return nil, fmt.Errorf("could not read signature file %s: %w", gzipStreams[0], err)
+		if err := os.Rename(gzipStreams[0], split.signature); err != nil {
+			return nil, fmt.Errorf("could not rename signature file %s: %w", gzipStreams[0], err)
 		}
-		split.Signature = b
 	}
 
-	// TODO(jonjohnsonjr): Do this during the first decompression.
 	dataFile := gzipStreams[controlDataIndex+1]
 	r, err := os.Open(dataFile)
 	if err != nil {
 		return nil, fmt.Errorf("open %q: %w", dataFile, err)
 	}
 	defer r.Close()
-
-	// TODO: Align with cache stuff.
-	if a.cache == nil {
-		return nil, fmt.Errorf("cache is nil")
-	}
-
-	u, err := a.url(pkg.Url())
-	if err != nil {
-		return nil, err
-	}
-
-	p, err := cachePathFromURL(a.cache.dir, u)
-	if err != nil {
-		return nil, err
-	}
-
-	split.uncompressed = p + ".tar"
-	split.compressed = p + ".targz"
 
 	trunc, err := os.Create(split.uncompressed)
 	if err != nil {
@@ -393,12 +259,105 @@ func (a *APK) splitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 	}
 	defer ztrunc.Close()
 
-	split.Files, err = a.truncateEOF(ctx, ztrunc, trunc, r)
+	installed, err := a.truncateEOF(ctx, ztrunc, trunc, r)
 	if err != nil {
 		return nil, fmt.Errorf("truncating %q: %w", dataFile, err)
 	}
 
+	inst, err := os.Create(split.installed)
+	if err != nil {
+		return nil, err
+	}
+	defer inst.Close()
+
+	if err := writeInstalledPackage(inst, pkg.Package, installed); err != nil {
+		return nil, fmt.Errorf("unable to write %q for %s: %w", split.installed, pkg.Name, err)
+	}
+
+	scripts, err := os.Create(split.scripts)
+	if err != nil {
+		return nil, err
+	}
+	defer scripts.Close()
+
+	triggers, err := os.Create(split.triggers)
+	if err != nil {
+		return nil, err
+	}
+	defer triggers.Close()
+
+	control, err := split.Control()
+	if err != nil {
+		return nil, fmt.Errorf("reading control: %w", err)
+	}
+	defer control.Close()
+
+	zr, err := gzip.NewReader(control)
+	if err != nil {
+		return nil, err
+	}
+	tr := tar.NewReader(zr)
+	tw := tar.NewWriter(scripts)
+
+	// Update scripts and triggers.
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if header.Name == ".PKGINFO" { //nolint:goconst
+			if err := writeTriggers(tr, triggers, pkg); err != nil {
+				return nil, fmt.Errorf("writing triggers for %s: %w", pkg.Name, err)
+			}
+
+			// .PKGINFO is the only file that isn't a script
+			continue
+		}
+
+		header.Name = fmt.Sprintf("%s-%s.Q1%s%s", pkg.Name, pkg.Version, base64.StdEncoding.EncodeToString(pkg.Checksum), header.Name)
+		if err := tw.WriteHeader(header); err != nil {
+			return nil, fmt.Errorf("unable to write scripts header for %s: %w", header.Name, err)
+		}
+		if _, err := io.CopyN(tw, tr, header.Size); err != nil {
+			return nil, fmt.Errorf("unable to write content for %s: %w", header.Name, err)
+		}
+	}
+
+	// Note Flush() not Close() because we don't want to EOF the tar.
+	if err := tw.Flush(); err != nil {
+		return nil, fmt.Errorf("failed to flush scripts: %w", err)
+	}
+
 	return &split, nil
+}
+
+func writeTriggers(tr *tar.Reader, w io.Writer, pkg *repository.RepositoryPackage) error {
+	b, err := io.ReadAll(tr)
+	if err != nil {
+		return fmt.Errorf("unable to read .PKGINFO from control tar.gz file: %w", err)
+	}
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
+		parts := strings.Split(line, "=")
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if key != "triggers" {
+			continue
+		}
+		if _, err := w.Write([]byte(fmt.Sprintf("%s %s\n", base64.StdEncoding.EncodeToString(pkg.Checksum), value))); err != nil {
+			return fmt.Errorf("unable to write triggers file %s: %w", triggersFilePath, err)
+		}
+		break
+	}
+
+	return nil
 }
 
 // TODO(jonjohnsonjr): This is serial currently, but we just need a writerAt to fix that.

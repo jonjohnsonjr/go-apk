@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -88,8 +89,8 @@ type deviceFile struct {
 }
 
 var baseDirectories = []directory{
-	//{"/tmp", 0o777 | fs.ModeSticky},
-	{"tmp", 0o777},
+	{"tmp", 0o777 | fs.ModeSticky},
+	//{"tmp", 0o777},
 	{"/dev", 0o755},
 	{"/etc", 0o755},
 	{"/lib", 0o755},
@@ -125,6 +126,12 @@ var initFiles = []file{
 	{"/lib/apk/db/lock", 0o600, nil},
 	{"/lib/apk/db/triggers", 0o644, nil},
 	{"/lib/apk/db/installed", 0o644, nil},
+}
+
+// files is a list of files to create relative to the root, as well as optional content.
+// We will not do MkdirAll for the parent dir it is in, so it must exist.
+var tigerInitFiles = []file{
+	{"/lib/apk/db/lock", 0o600, nil},
 }
 
 // deviceFiles is a list of files to create relative to the root.
@@ -190,7 +197,84 @@ func (a *APK) ListInitFiles() []tar.Header {
 		Uid:      0,
 		Gid:      0,
 	})
+
 	return headers
+}
+
+func AppendInitFiles(tw *tar.Writer, arch string) error {
+	// TODO(jonjohnsonjr): Do this once (minus the arch).
+	headers := make([]tar.Header, 0, len(baseDirectories)+len(initDirectories)+len(tigerInitFiles)+len(initDeviceFiles)+1)
+
+	for _, e := range baseDirectories {
+		headers = append(headers, tar.Header{
+			Name:     e.path,
+			Mode:     int64(e.perms),
+			Typeflag: tar.TypeDir,
+			Uid:      0,
+			Gid:      0,
+		})
+	}
+
+	for _, e := range initDirectories {
+		headers = append(headers, tar.Header{
+			Name:     e.path,
+			Mode:     int64(e.perms),
+			Typeflag: tar.TypeDir,
+			Uid:      0,
+			Gid:      0,
+		})
+	}
+	for _, e := range initFiles {
+		headers = append(headers, tar.Header{
+			Name:     e.path,
+			Mode:     int64(e.perms),
+			Typeflag: tar.TypeReg,
+			Uid:      0,
+			Gid:      0,
+		})
+	}
+	for _, e := range initDeviceFiles {
+		headers = append(headers, tar.Header{
+			Name:     e.path,
+			Typeflag: tar.TypeChar,
+			Mode:     int64(e.perms),
+			Uid:      0,
+			Gid:      0,
+		})
+	}
+
+	// add scripts.tar with nothing in it
+	headers = append(headers, tar.Header{
+		Name:     scriptsFilePath,
+		Mode:     int64(scriptsTarPerms),
+		Typeflag: tar.TypeReg,
+		Uid:      0,
+		Gid:      0,
+	})
+
+	for _, hdr := range headers {
+		if err := tw.WriteHeader(&hdr); err != nil {
+			return err
+		}
+	}
+
+	content := []byte(arch + "\n")
+	hdr := tar.Header{
+		Name:     "/etc/apk/arch",
+		Typeflag: tar.TypeReg,
+		Mode:     0644,
+		Size:     int64(len(content)),
+		Uid:      0,
+		Gid:      0,
+	}
+	if err := tw.WriteHeader(&hdr); err != nil {
+		return err
+	}
+	if _, err := tw.Write(content); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Initialize the APK database for a given build context.
@@ -405,6 +489,85 @@ func (a *APK) InitKeyring(ctx context.Context, keyFiles, extraKeyFiles []string)
 	return eg.Wait()
 }
 
+// TODO(jonjohnsonjr): Fetch these once per invocation.
+func AppendKeyring(ctx context.Context, tw *tar.Writer, keyFiles, extraKeyFiles []string) (err error) {
+	ctx, span := otel.Tracer("apko").Start(ctx, "AppendKeyring")
+	defer span.End()
+
+	if len(extraKeyFiles) > 0 {
+		keyFiles = append(keyFiles, extraKeyFiles...)
+	}
+
+	var eg errgroup.Group
+
+	for _, element := range keyFiles {
+		element := element
+		eg.Go(func() error {
+			// Normalize the element as a URI, so that local paths
+			// are translated into file:// URLs, allowing them to be parsed
+			// into a url.URL{}.
+			var asURI uri.URI
+			if strings.HasPrefix(element, "https://") {
+				asURI, _ = uri.Parse(element)
+			} else {
+				asURI = uri.New(element)
+			}
+			asURL, err := url.Parse(string(asURI))
+			if err != nil {
+				return fmt.Errorf("failed to parse key as URI: %w", err)
+			}
+
+			var data []byte
+			switch asURL.Scheme {
+			case "file": //nolint:goconst
+				data, err = os.ReadFile(element)
+				if err != nil {
+					return fmt.Errorf("failed to read apk key: %w", err)
+				}
+			case "https": //nolint:goconst
+				client := &http.Client{}
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, asURL.String(), nil)
+				if err != nil {
+					return err
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					return fmt.Errorf("failed to fetch apk key: %w", err)
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode < 200 || resp.StatusCode > 299 {
+					return errors.New("failed to fetch apk key: http response indicated error")
+				}
+
+				data, err = io.ReadAll(resp.Body)
+				if err != nil {
+					return fmt.Errorf("failed to read apk key response: %w", err)
+				}
+			default:
+				return fmt.Errorf("scheme %s not supported", asURL.Scheme)
+			}
+
+			hdr := tar.Header{
+				Name: path.Join("etc", "apk", "keys", path.Base(element)),
+				Size: int64(len(data)),
+				Mode: 0644,
+			}
+			// #nosec G306 -- apk keyring must be publicly readable
+			if err := tw.WriteHeader(&hdr); err != nil {
+				return fmt.Errorf("failed to write header for apk key %s: %w", hdr.Name, err)
+			}
+			if _, err := tw.Write(data); err != nil {
+				return fmt.Errorf("failed to write apk key %s: %w", hdr.Name, err)
+			}
+
+			return nil
+		})
+	}
+
+	return eg.Wait()
+}
+
 // ResolveWorld determine the target state for the requested dependencies in /etc/apk/world. Do not install anything.
 func (a *APK) ResolveWorld(ctx context.Context) (toInstall []*repository.RepositoryPackage, conflicts []string, err error) {
 	ctx, span := otel.Tracer("go-apk").Start(ctx, "ResolveWorld")
@@ -576,6 +739,81 @@ func (a *APK) fetchAlpineKeys(ctx context.Context, versions []string) error {
 		}
 		defer f.Close()
 		if _, err := io.Copy(f, res.Body); err != nil {
+			return fmt.Errorf("failed to write key file %s: %w", filename, err)
+		}
+	}
+	return nil
+}
+
+// TODO(jonjohnsonjr): Fetch these once per invocation and cache them.
+func AppendAlpineKeys(ctx context.Context, tw *tar.Writer, arch string, versions []string) error {
+	ctx, span := otel.Tracer("apko").Start(ctx, "fetchAlpineKeys")
+	defer span.End()
+	u := alpineReleasesURL
+	client := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch alpine releases: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("unable to get alpine releases at %s: %v", u, res.Status)
+	}
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read alpine releases: %w", err)
+	}
+	var releases Releases
+	if err := json.Unmarshal(b, &releases); err != nil {
+		return fmt.Errorf("failed to unmarshal alpine releases: %w", err)
+	}
+	// what is the alpine version we use?
+	var alpineVersions = versions
+	if len(alpineVersions) == 0 {
+		alpineVersions = append(alpineVersions, releases.LatestStable)
+	}
+	var urls []string
+	// now just need to get the keys for the desired architecture and releases
+	for _, version := range alpineVersions {
+		branch := releases.GetReleaseBranch(version)
+		if branch == nil {
+			continue
+		}
+		urls = append(urls, branch.KeysFor(arch, time.Now())...)
+	}
+	if len(urls) == 0 {
+		return &NoKeysFoundError{arch: arch, releases: alpineVersions}
+	}
+	// get the keys for each URL and save them to a file with that name
+	for _, u := range urls {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return err
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to fetch alpine key %s: %w", u, err)
+		}
+		defer res.Body.Close()
+		basefilenameEscape := path.Base(u)
+		basefilename, err := url.PathUnescape(basefilenameEscape)
+		if err != nil {
+			return fmt.Errorf("failed to unescape key filename %s: %w", basefilenameEscape, err)
+		}
+		filename := path.Join(keysDirPath, basefilename)
+		hdr := tar.Header{
+			Name: filename,
+			Size: res.ContentLength,
+			Mode: 0644,
+		}
+		if err := tw.WriteHeader(&hdr); err != nil {
+			return fmt.Errorf("failed to write header for %s: %w", filename, err)
+		}
+		if _, err := io.Copy(tw, res.Body); err != nil {
 			return fmt.Errorf("failed to write key file %s: %w", filename, err)
 		}
 	}

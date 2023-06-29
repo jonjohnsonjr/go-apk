@@ -15,11 +15,13 @@
 package apk
 
 import (
+	"archive/tar"
 	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -100,6 +102,26 @@ func (a *APK) SetRepositories(ctx context.Context, repos []string) error {
 	if err := a.fs.WriteFile(filepath.Join("etc", "apk", "repositories"),
 		[]byte(data), 0o644); err != nil {
 		return fmt.Errorf("failed to write apk repositories list: %w", err)
+	}
+
+	return nil
+}
+
+func AppendRepositories(ctx context.Context, tw *tar.Writer, repos []string) error {
+	if len(repos) == 0 {
+		return fmt.Errorf("must provide at least one repository")
+	}
+	data := []byte(strings.Join(repos, "\n") + "\n")
+	hdr := tar.Header{
+		Name: path.Join("etc", "apk", "repositories"),
+		Size: int64(len(data)),
+		Mode: 0644,
+	}
+	if err := tw.WriteHeader(&hdr); err != nil {
+		return fmt.Errorf("failed to write header for etc/apk/repositories: %w", err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		return fmt.Errorf("failed to write etc/apk/repositories: %w", err)
 	}
 
 	return nil

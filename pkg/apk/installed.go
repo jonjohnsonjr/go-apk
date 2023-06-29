@@ -39,6 +39,7 @@ type InstalledPackage struct {
 
 // getInstalledPackages get list of installed packages
 func (a *APK) GetInstalled() ([]*InstalledPackage, error) {
+	// TODO(jonjohnsonjr): Hold this in memory.
 	installedFile, err := a.fs.Open(installedFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("could not open installed file in %s at %s: %w", a.fs, installedFilePath, err)
@@ -47,15 +48,7 @@ func (a *APK) GetInstalled() ([]*InstalledPackage, error) {
 	return parseInstalled(installedFile)
 }
 
-// addInstalledPackage add a package to the list of installed packages
-func (a *APK) addInstalledPackage(pkg *repository.Package, files []tar.Header) error {
-	// be sure to open the file in append mode so we add to the end
-	installedFile, err := a.fs.OpenFile(installedFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("could not open installed file at %s: %w", installedFilePath, err)
-	}
-	defer installedFile.Close()
-
+func writeInstalledPackage(w io.Writer, pkg *repository.Package, files []tar.Header) error {
 	// sort the files by directory
 	sortedFiles := sortTarHeaders(files)
 	// package lines
@@ -83,10 +76,23 @@ func (a *APK) addInstalledPackage(pkg *repository.Package, files []tar.Header) e
 	}
 	// write to installed file
 	b := []byte(strings.Join(pkgLines, "\n") + "\n\n")
-	if _, err := installedFile.Write(b); err != nil {
+	if _, err := w.Write(b); err != nil {
 		return err
 	}
+
 	return nil
+}
+
+// addInstalledPackage add a package to the list of installed packages
+func (a *APK) addInstalledPackage(pkg *repository.Package, files []tar.Header) error {
+	// be sure to open the file in append mode so we add to the end
+	installedFile, err := a.fs.OpenFile(installedFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("could not open installed file at %s: %w", installedFilePath, err)
+	}
+	defer installedFile.Close()
+
+	return writeInstalledPackage(installedFile, pkg, files)
 }
 
 // isInstalledPackage check if a specific package is installed

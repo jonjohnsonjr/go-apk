@@ -15,9 +15,11 @@
 package apk
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -58,6 +60,28 @@ func (a *APK) SetWorld(ctx context.Context, packages []string) error {
 	if err := a.fs.WriteFile(filepath.Join("etc", "apk", "world"),
 		[]byte(data), 0o644); err != nil {
 		return fmt.Errorf("failed to write apk world: %w", err)
+	}
+
+	return nil
+}
+
+func AppendWorld(ctx context.Context, tw *tar.Writer, packages []string) error {
+	copied := make([]string, len(packages))
+	copy(copied, packages)
+	sort.Strings(copied)
+
+	data := []byte(strings.Join(copied, "\n") + "\n")
+
+	hdr := tar.Header{
+		Name: path.Join("etc", "apk", "world"),
+		Size: int64(len(data)),
+		Mode: 0644,
+	}
+	if err := tw.WriteHeader(&hdr); err != nil {
+		return fmt.Errorf("failed to write header for etc/apk/world: %w", err)
+	}
+	if _, err := tw.Write(data); err != nil {
+		return fmt.Errorf("failed to write etc/apk/world: %w", err)
 	}
 
 	return nil
