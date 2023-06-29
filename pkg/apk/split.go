@@ -87,7 +87,6 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 		return nil, err
 	}
 
-	// TODO(jonjohnsonjr): Check to see if this already exists and skip it.
 	split := SplitApk{
 		uncompressed: p + ".tar",
 		compressed:   p + ".targz",
@@ -98,6 +97,7 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 		triggers:     p + ".triggers",
 	}
 
+	// TODO(jonjohnsonjr): Better way to check to see if this already exists and skip it.
 	if _, err := split.Control(); err == nil {
 		return &split, nil
 	}

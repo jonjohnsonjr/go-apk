@@ -224,7 +224,7 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 			Gid:      0,
 		})
 	}
-	for _, e := range initFiles {
+	for _, e := range tigerInitFiles {
 		headers = append(headers, tar.Header{
 			Name:     e.path,
 			Mode:     int64(e.perms),
@@ -242,15 +242,6 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 			Gid:      0,
 		})
 	}
-
-	// add scripts.tar with nothing in it
-	headers = append(headers, tar.Header{
-		Name:     scriptsFilePath,
-		Mode:     int64(scriptsTarPerms),
-		Typeflag: tar.TypeReg,
-		Uid:      0,
-		Gid:      0,
-	})
 
 	for _, hdr := range headers {
 		if err := tw.WriteHeader(&hdr); err != nil {
@@ -352,12 +343,14 @@ func (a *APK) InitDB(ctx context.Context, versions ...string) error {
 	// nothing to add to it; scripts.tar should be empty
 
 	// get the alpine-keys base keys for our usage
-	if err := a.fetchAlpineKeys(ctx, versions); err != nil {
-		var nokeysErr *NoKeysFoundError
-		if !errors.As(err, &nokeysErr) {
-			return fmt.Errorf("failed to fetch alpine-keys: %w", err)
+	if len(versions) != 0 {
+		if err := a.fetchAlpineKeys(ctx, versions); err != nil {
+			var nokeysErr *NoKeysFoundError
+			if !errors.As(err, &nokeysErr) {
+				return fmt.Errorf("failed to fetch alpine-keys: %w", err)
+			}
+			a.logger.Infof("ignoring missing keys: %s", err.Error())
 		}
-		a.logger.Infof("ignoring missing keys: %s", err.Error())
 	}
 
 	a.logger.Infof("finished initializing apk database")

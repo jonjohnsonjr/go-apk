@@ -71,7 +71,7 @@ func (t *cacheTransport) RoundTrip(request *http.Request) (*http.Response, error
 		// no etag, just return the file
 		f, err := os.Open(cacheFile)
 		if err != nil {
-			return &http.Response{StatusCode: 404}, nil
+			return &http.Response{StatusCode: 404}, fmt.Errorf("Open(%q): %w", cacheFile, err)
 		}
 		return &http.Response{
 			StatusCode: 200,
@@ -79,8 +79,11 @@ func (t *cacheTransport) RoundTrip(request *http.Request) (*http.Response, error
 		}, nil
 	}
 	resp, err := t.wrapped.Head(request.URL.String())
-	if err != nil || resp.StatusCode != 200 {
-		return resp, err
+	if err != nil {
+		return resp, fmt.Errorf("Head %q: %w", request.URL.String(), err)
+	}
+	if resp.StatusCode != 200 {
+		return resp, fmt.Errorf("Head %q: %d", request.URL.String(), resp.StatusCode)
 	}
 	remoteEtag, ok := resp.Header[http.CanonicalHeaderKey("etag")]
 	if !ok || len(remoteEtag) == 0 || remoteEtag[0] == "" {
@@ -95,7 +98,7 @@ func (t *cacheTransport) RoundTrip(request *http.Request) (*http.Response, error
 	// it matched, so use our cache file
 	f, err := os.Open(cacheFile)
 	if err != nil {
-		return &http.Response{StatusCode: 404}, nil
+		return &http.Response{StatusCode: 404}, fmt.Errorf("Open(%q): %w", cacheFile, err)
 	}
 	return &http.Response{
 		StatusCode: 200,
@@ -147,7 +150,7 @@ func (t *cacheTransport) cachePathFromURL(u *url.URL) (string, error) {
 func cachePathFromURL(root string, u *url.URL) (string, error) {
 	// the last two levels are what we append. For example https://example.com/foo/bar/x86_64/baz.apk
 	// means we want to append x86_64/baz.apk to our cache root
-	u2 := u
+	u2 := *u
 	u2.ForceQuery = false
 	u2.RawFragment = ""
 	u2.RawQuery = ""

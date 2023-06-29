@@ -75,7 +75,7 @@ func writeInstalledPackage(w io.Writer, pkg *repository.Package, files []tar.Hea
 		}
 	}
 	// write to installed file
-	b := []byte(strings.Join(pkgLines, "\n") + "\n\n")
+	b := []byte(strings.Join(pkgLines, "\n") + "\n")
 	if _, err := w.Write(b); err != nil {
 		return err
 	}
@@ -92,7 +92,14 @@ func (a *APK) addInstalledPackage(pkg *repository.Package, files []tar.Header) e
 	}
 	defer installedFile.Close()
 
-	return writeInstalledPackage(installedFile, pkg, files)
+	if err := writeInstalledPackage(installedFile, pkg, files); err != nil {
+		return fmt.Errorf("writing installed: %w", err)
+	}
+	if _, err := installedFile.Write([]byte("\n")); err != nil {
+		return fmt.Errorf("writing installed: %w", err)
+	}
+
+	return nil
 }
 
 // isInstalledPackage check if a specific package is installed

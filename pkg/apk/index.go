@@ -113,7 +113,7 @@ func GetRepositoryIndexes(ctx context.Context, repos []string, keys map[string][
 			case http.StatusOK:
 				// this is fine
 			case http.StatusNotFound:
-				return nil, fmt.Errorf("repository index not found for architecture %s at %s", arch, u)
+				return nil, fmt.Errorf("repository index not found for architecture %s at %s (%q)", arch, u, asURL.String())
 			default:
 				return nil, fmt.Errorf("unexpected status code %d when getting repository index for architecture %s at %s", res.StatusCode, arch, u)
 			}
