@@ -89,13 +89,20 @@ type deviceFile struct {
 }
 
 var baseDirectories = []directory{
-	{"tmp", 0o777 | fs.ModeSticky},
-	//{"tmp", 0o777},
-	{"/dev", 0o755},
+	{"/tmp", 0o777 | fs.ModeSticky},
 	{"/etc", 0o755},
 	{"/lib", 0o755},
 	{"/proc", 0o555},
 	{"/var", 0o755},
+}
+
+var tigerBaseDirectories = []directory{
+	{"tmp", 0o777 | fs.ModeSticky},
+	{"dev", 0o755},
+	{"etc", 0o755},
+	{"lib", 0o755},
+	{"proc", 0o555},
+	{"var", 0o755},
 }
 
 // directories is a list of directories to create relative to the root. It will not do MkdirAll, so you
@@ -118,6 +125,16 @@ var initDirectories = []directory{
 	{"/var/cache/misc", 0o755},
 }
 
+var tigerInitDirectories = []directory{
+	{"etc/apk", 0o755},
+	{"etc/apk/keys", 0o755},
+	{"lib/apk", 0o755},
+	{"lib/apk/db", 0o755},
+	{"var/cache", 0o755},
+	{"var/cache/apk", 0o755},
+	{"var/cache/misc", 0o755},
+}
+
 // files is a list of files to create relative to the root, as well as optional content.
 // We will not do MkdirAll for the parent dir it is in, so it must exist.
 var initFiles = []file{
@@ -131,7 +148,7 @@ var initFiles = []file{
 // files is a list of files to create relative to the root, as well as optional content.
 // We will not do MkdirAll for the parent dir it is in, so it must exist.
 var tigerInitFiles = []file{
-	{"/lib/apk/db/lock", 0o600, nil},
+	{"lib/apk/db/lock", 0o600, nil},
 }
 
 // deviceFiles is a list of files to create relative to the root.
@@ -141,6 +158,14 @@ var initDeviceFiles = []deviceFile{
 	{"/dev/null", 1, 3, 0o666},
 	{"/dev/random", 1, 8, 0o666},
 	{"/dev/console", 5, 1, 0o620},
+}
+
+var tigerInitDeviceFiles = []deviceFile{
+	{"dev/zero", 1, 5, 0o666},
+	{"dev/urandom", 1, 9, 0o666},
+	{"dev/null", 1, 3, 0o666},
+	{"dev/random", 1, 8, 0o666},
+	{"dev/console", 5, 1, 0o620},
 }
 
 // SetClient set the http client to use for downloading packages.
@@ -203,9 +228,9 @@ func (a *APK) ListInitFiles() []tar.Header {
 
 func AppendInitFiles(tw *tar.Writer, arch string) error {
 	// TODO(jonjohnsonjr): Do this once (minus the arch).
-	headers := make([]tar.Header, 0, len(baseDirectories)+len(initDirectories)+len(tigerInitFiles)+len(initDeviceFiles)+1)
+	headers := make([]tar.Header, 0, len(tigerBaseDirectories)+len(tigerInitDirectories)+len(tigerInitFiles)+len(tigerInitDeviceFiles)+1)
 
-	for _, e := range baseDirectories {
+	for _, e := range tigerBaseDirectories {
 		headers = append(headers, tar.Header{
 			Name:     e.path,
 			Mode:     int64(e.perms),
@@ -215,7 +240,7 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 		})
 	}
 
-	for _, e := range initDirectories {
+	for _, e := range tigerInitDirectories {
 		headers = append(headers, tar.Header{
 			Name:     e.path,
 			Mode:     int64(e.perms),
@@ -233,7 +258,7 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 			Gid:      0,
 		})
 	}
-	for _, e := range initDeviceFiles {
+	for _, e := range tigerInitDeviceFiles {
 		headers = append(headers, tar.Header{
 			Name:     e.path,
 			Typeflag: tar.TypeChar,
@@ -251,7 +276,7 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 
 	content := []byte(arch + "\n")
 	hdr := tar.Header{
-		Name:     "/etc/apk/arch",
+		Name:     "etc/apk/arch",
 		Typeflag: tar.TypeReg,
 		Mode:     0644,
 		Size:     int64(len(content)),
@@ -831,7 +856,7 @@ func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPack
 		return fmt.Errorf("unable to expand apk for package %s: %w", pkg.Name, err)
 	}
 	defer expanded.Close()
-	installedFiles, err := a.installAPKFiles(expanded.PackageData, pkg.Origin, pkg.Replaces)
+	installedFiles, err := a.installAPKFiles(ctx, expanded.PackageData, pkg.Origin, pkg.Replaces)
 	if err != nil {
 		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
 	}

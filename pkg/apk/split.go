@@ -16,6 +16,7 @@ package apk
 
 import (
 	"archive/tar"
+	"bufio"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -25,7 +26,6 @@ import (
 	"strings"
 
 	"github.com/klauspost/compress/gzip"
-	"github.com/klauspost/pgzip"
 
 	"gitlab.alpinelinux.org/alpine/go/pkg/repository"
 	"go.opentelemetry.io/otel"
@@ -292,6 +292,7 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 	}
 	defer control.Close()
 
+	// TODO(jonjohnsonjr): We could do this on the first pass.
 	zr, err := gzip.NewReader(control)
 	if err != nil {
 		return nil, err
@@ -310,6 +311,7 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 		}
 
 		if header.Name == ".PKGINFO" { //nolint:goconst
+			// triggers
 			if err := writeTriggers(tr, triggers, pkg); err != nil {
 				return nil, fmt.Errorf("writing triggers for %s: %w", pkg.Name, err)
 			}
@@ -318,7 +320,11 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 			continue
 		}
 
+		// scripts
+
+		// TODO(jonjohnsonjr): Do we have to overwrite this?
 		header.Name = fmt.Sprintf("%s-%s.Q1%s%s", pkg.Name, pkg.Version, base64.StdEncoding.EncodeToString(pkg.Checksum), header.Name)
+
 		if err := tw.WriteHeader(header); err != nil {
 			return nil, fmt.Errorf("unable to write scripts header for %s: %w", header.Name, err)
 		}
@@ -379,7 +385,11 @@ func (a *APK) truncateEOF(ctx context.Context, w io.Writer, uw io.Writer, r io.R
 	// TODO(jonjohnsonjr): Avoid recompressing every apk by doing clever flate-level things.
 	// It is very easy to strip the tar EOF by recompressing everything, but it is very slow.
 	// This is still a big win because we can do it once per APK.
-	zw := pgzip.NewWriter(w)
+	// TODO(jonjohnsonjr): If we do end up having to do this, we should reuse these writers.
+	bw := bufio.NewWriter(w)
+	defer bw.Flush()
+
+	zw := gzip.NewWriter(bw)
 
 	// Before recompressing, also write out the uncompressed tar to uw to avoid paying the flate cost twice.
 	mw := io.MultiWriter(zw, uw)
@@ -393,6 +403,9 @@ func (a *APK) truncateEOF(ctx context.Context, w io.Writer, uw io.Writer, r io.R
 
 	tr := tar.NewReader(zr)
 
+	// TODO(jonjohnsonjr): We may want to omit directories that we populate ourselves.
+	// Currently, we just append them to the tar stream, but that means we have duplicate
+	// directory entries.
 	var files []tar.Header
 	for {
 		header, err := tr.Next()
