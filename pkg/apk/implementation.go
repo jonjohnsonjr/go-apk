@@ -103,6 +103,10 @@ var tigerBaseDirectories = []directory{
 	{"lib", 0o755},
 	{"proc", 0o555},
 	{"var", 0o755},
+	{"usr", 0o755},
+	{"bin", 0o755},
+	{"usr/bin", 0o755},
+	{"usr/lib", 0o755},
 }
 
 // directories is a list of directories to create relative to the root. It will not do MkdirAll, so you
@@ -226,7 +230,7 @@ func (a *APK) ListInitFiles() []tar.Header {
 	return headers
 }
 
-func AppendInitFiles(tw *tar.Writer, arch string) error {
+func AppendInitFiles(tw *tar.Writer, arch string) ([]tar.Header, error) {
 	// TODO(jonjohnsonjr): Do this once (minus the arch).
 	headers := make([]tar.Header, 0, len(tigerBaseDirectories)+len(tigerInitDirectories)+len(tigerInitFiles)+len(tigerInitDeviceFiles)+1)
 
@@ -270,7 +274,7 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 
 	for _, hdr := range headers {
 		if err := tw.WriteHeader(&hdr); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -283,14 +287,15 @@ func AppendInitFiles(tw *tar.Writer, arch string) error {
 		Uid:      0,
 		Gid:      0,
 	}
+	headers = append(headers, hdr)
 	if err := tw.WriteHeader(&hdr); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tw.Write(content); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return headers, nil
 }
 
 // Initialize the APK database for a given build context.
@@ -844,6 +849,9 @@ func AppendAlpineKeys(ctx context.Context, tw *tar.Writer, arch string, versions
 func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPackage, sourceDateEpoch *time.Time) error {
 	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
 
+	ctx, span := otel.Tracer("go-apk").Start(ctx, fmt.Sprintf("installPackage(%q)", pkg.Name))
+	defer span.End()
+
 	r, err := a.fetchPackage(ctx, pkg)
 	if err != nil {
 		return err
@@ -907,7 +915,7 @@ func (a *APK) url(u string) (*url.URL, error) {
 }
 
 func (a *APK) fetchPackage(ctx context.Context, pkg *repository.RepositoryPackage) (io.ReadCloser, error) {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "fetchPackage")
+	ctx, span := otel.Tracer("go-apk").Start(ctx, fmt.Sprintf("fetchPackage(%q)", pkg.Name))
 	defer span.End()
 
 	u := pkg.Url()

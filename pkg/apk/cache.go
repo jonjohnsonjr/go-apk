@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.opentelemetry.io/otel"
 )
 
 // cache
@@ -48,6 +50,9 @@ type cacheTransport struct {
 }
 
 func (t *cacheTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	ctx, span := otel.Tracer("apko").Start(request.Context(), "cache.Roundtrip")
+	defer span.End()
+
 	// do we have the file in the cache?
 	if request.URL == nil {
 		return nil, fmt.Errorf("no URL in request")
@@ -78,7 +83,11 @@ func (t *cacheTransport) RoundTrip(request *http.Request) (*http.Response, error
 			Body:       f,
 		}, nil
 	}
-	resp, err := t.wrapped.Head(request.URL.String())
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodHead, request.URL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := t.wrapped.Do(hreq)
 	if err != nil {
 		return resp, fmt.Errorf("Head %q: %w", request.URL.String(), err)
 	}

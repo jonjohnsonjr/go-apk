@@ -17,11 +17,13 @@ package apk
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 
@@ -32,6 +34,9 @@ import (
 )
 
 type SplitApk struct {
+	Files   []tar.Header
+	Busybox []string
+
 	signature string
 	control   string
 	installed string
@@ -68,8 +73,8 @@ func (s *SplitApk) Triggers() (io.ReadSeekCloser, error) {
 }
 
 // forked from ExpandApk
-func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (*SplitApk, error) {
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "SplitApk")
+func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage, omit map[string]struct{}) (*SplitApk, error) {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, fmt.Sprintf("SplitApk(%q)", pkg.Name))
 	defer span.End()
 
 	// TODO: Align with cache stuff.
@@ -122,6 +127,8 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 	if err != nil {
 		return nil, err
 	}
+
+	_, span2 := otel.Tracer("go-apk").Start(ctx, "expand")
 
 	sw, err := newExpandApkWriter(dir, "stream", "tar.gz")
 	if err != nil {
@@ -259,7 +266,9 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 	}
 	defer ztrunc.Close()
 
-	installed, err := a.truncateEOF(ctx, ztrunc, trunc, r)
+	span2.End()
+
+	split.Files, split.Busybox, err = a.truncateEOF(ctx, ztrunc, trunc, r, omit)
 	if err != nil {
 		return nil, fmt.Errorf("truncating %q: %w", dataFile, err)
 	}
@@ -270,7 +279,7 @@ func (a *APK) SplitApk(ctx context.Context, pkg *repository.RepositoryPackage) (
 	}
 	defer inst.Close()
 
-	if err := writeInstalledPackage(inst, pkg.Package, installed); err != nil {
+	if err := writeInstalledPackage(inst, pkg.Package, split.Files); err != nil {
 		return nil, fmt.Errorf("unable to write %q for %s: %w", split.installed, pkg.Name, err)
 	}
 
@@ -378,7 +387,7 @@ func (a *APK) appendAPK(ctx context.Context, w io.Writer, gzipIn io.Reader) erro
 	return err
 }
 
-func (a *APK) truncateEOF(ctx context.Context, w io.Writer, uw io.Writer, r io.Reader) ([]tar.Header, error) {
+func (a *APK) truncateEOF(ctx context.Context, w io.Writer, uw io.Writer, r io.Reader, omit map[string]struct{}) ([]tar.Header, []string, error) {
 	ctx, span := otel.Tracer("go-apk").Start(ctx, "truncateEOF")
 	defer span.End()
 
@@ -398,7 +407,7 @@ func (a *APK) truncateEOF(ctx context.Context, w io.Writer, uw io.Writer, r io.R
 
 	zr, err := gzip.NewReader(r)
 	if err != nil {
-		return nil, fmt.Errorf("gzip.NewReader: %w", err)
+		return nil, nil, fmt.Errorf("gzip.NewReader: %w", err)
 	}
 
 	tr := tar.NewReader(zr)
@@ -406,35 +415,54 @@ func (a *APK) truncateEOF(ctx context.Context, w io.Writer, uw io.Writer, r io.R
 	// TODO(jonjohnsonjr): We may want to omit directories that we populate ourselves.
 	// Currently, we just append them to the tar stream, but that means we have duplicate
 	// directory entries.
-	var files []tar.Header
+	var (
+		files []tar.Header
+		links []string
+	)
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("tr.Next(): %w", err)
+			return nil, nil, fmt.Errorf("tr.Next(): %w", err)
+		}
+
+		if _, ok := omit[header.Name]; ok {
+			log.Printf("skipping %s", header.Name)
+			continue
 		}
 
 		files = append(files, *header)
 
 		if err := tw.WriteHeader(header); err != nil {
-			return nil, fmt.Errorf("tw.WriteHeader(): %w", err)
+			return nil, nil, fmt.Errorf("tw.WriteHeader(): %w", err)
 		}
 
-		if _, err := io.Copy(tw, tr); err != nil {
-			return nil, fmt.Errorf("copying %s: %w", header.Name, err)
+		if strings.HasPrefix(header.Name, "etc/busybox-paths.d/") {
+			buf := bytes.Buffer{}
+			fw := io.MultiWriter(tw, &buf)
+			if _, err := io.Copy(fw, tr); err != nil {
+				return nil, nil, fmt.Errorf("copying %s: %w", header.Name, err)
+			}
+
+			newLinks := strings.Split(string(buf.Bytes()), "\n")
+			links = append(links, newLinks...)
+		} else {
+			if _, err := io.Copy(tw, tr); err != nil {
+				return nil, nil, fmt.Errorf("copying %s: %w", header.Name, err)
+			}
 		}
 	}
 
 	// Note that we are calling Flush, not Close, which would append the EOF marker.
 	if err := tw.Flush(); err != nil {
-		return nil, fmt.Errorf("flushing tar: %w", err)
+		return nil, nil, fmt.Errorf("flushing tar: %w", err)
 	}
 
 	if err := zw.Close(); err != nil {
-		return nil, fmt.Errorf("closing gzip writer: %w", err)
+		return nil, nil, fmt.Errorf("closing gzip writer: %w", err)
 	}
 
-	return files, nil
+	return files, links, nil
 }
