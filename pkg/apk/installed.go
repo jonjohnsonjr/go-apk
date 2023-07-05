@@ -17,7 +17,7 @@ package apk
 import (
 	"archive/tar"
 	"bufio"
-	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -29,7 +29,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/gzip"
+
 	"gitlab.alpinelinux.org/alpine/go/repository"
+	"go.opentelemetry.io/otel"
 )
 
 type InstalledPackage struct {
@@ -38,7 +41,10 @@ type InstalledPackage struct {
 }
 
 // getInstalledPackages get list of installed packages
-func (a *APK) GetInstalled() ([]*InstalledPackage, error) {
+func (a *APK) GetInstalled(ctx context.Context) ([]*InstalledPackage, error) {
+	_, span := otel.Tracer("go-apk").Start(ctx, "GetInstalled")
+	defer span.End()
+
 	installedFile, err := a.fs.Open(installedFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("could not open installed file in %s at %s: %w", a.fs, installedFilePath, err)
@@ -90,8 +96,8 @@ func (a *APK) addInstalledPackage(pkg *repository.Package, files []tar.Header) e
 }
 
 // isInstalledPackage check if a specific package is installed
-func (a *APK) isInstalledPackage(pkg string) (bool, error) {
-	installedPackages, err := a.GetInstalled()
+func (a *APK) isInstalledPackage(ctx context.Context, pkg string) (bool, error) {
+	installedPackages, err := a.GetInstalled(ctx)
 	if err != nil {
 		return false, err
 	}

@@ -471,7 +471,7 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 	}
 	defer os.RemoveAll(dir)
 	for _, pkg := range conflicts {
-		isInstalled, err := a.isInstalledPackage(pkg)
+		isInstalled, err := a.isInstalledPackage(ctx, pkg)
 		if err != nil {
 			return fmt.Errorf("error checking if package %s is installed: %w", pkg, err)
 		}
@@ -527,7 +527,7 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 		i, pkg := i, pkg
 
 		g.Go(func() error {
-			isInstalled, err := a.isInstalledPackage(pkg.Name)
+			isInstalled, err := a.isInstalledPackage(ctx, pkg.Name)
 			if err != nil {
 				return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
 			}

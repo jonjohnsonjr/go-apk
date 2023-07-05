@@ -17,7 +17,6 @@ package apk
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha1" //nolint:gosec // this is what apk tools is using
 	"encoding/base64"
@@ -26,6 +25,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/klauspost/compress/gzip"
 
 	"go.opentelemetry.io/otel"
 )
@@ -169,7 +170,7 @@ func (a *APK) installAPKFiles(ctx context.Context, gzipIn io.Reader, origin, rep
 				// compare the origin of the package that we are installing now, to the origin of the package
 				// that provided the file. If the origins are the same, then we can allow the
 				// overwrite. Otherwise, we need to return an error.
-				installed, err := a.GetInstalled()
+				installed, err := a.GetInstalled(ctx)
 				if err != nil {
 					return nil, fmt.Errorf("unable to get list of installed packages and files: %w", err)
 				}
