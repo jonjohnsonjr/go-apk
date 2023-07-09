@@ -328,6 +328,11 @@ func ExpandApk(ctx context.Context, source io.Reader) (*APKExpanded, error) {
 		if _, err := f2.Write(b); err != nil {
 			return nil, fmt.Errorf("expandApk error 15: %w", err)
 		}
+
+		// TODO(jonjohnsonjr): Use CopyBuffer to speed this up on macOS.
+		// TODO(jonjohnsonjr): Do sha256 hashing of overall stream.
+		// TODO(jonjohnsonjr): Do sha1 verification of each file based on tar headers.
+		// TODO(jonjohnsonjr): Save tar headers in separate file.
 		if _, err := io.Copy(f2, f); err != nil {
 			return nil, fmt.Errorf("expandApk error 16: %w", err)
 		}
