@@ -229,11 +229,15 @@ func (a *APK) installAPKFiles(ctx context.Context, in io.Reader, origin, replace
 				continue
 			}
 			if err := a.fs.Symlink(header.Linkname, header.Name); err != nil {
-				return nil, fmt.Errorf("unable to install symlink from %s -> %s: %w", header.Name, header.Linkname, err)
+				if os.IsNotExist(err) {
+					return nil, fmt.Errorf("unable to install symlink from %s -> %s: %w", header.Name, header.Linkname, err)
+				}
 			}
 		case tar.TypeLink:
 			if err := a.fs.Link(header.Linkname, header.Name); err != nil {
-				return nil, err
+				if os.IsNotExist(err) {
+					return nil, err
+				}
 			}
 		default:
 			return nil, fmt.Errorf("unsupported file type %s %v", header.Name, header.Typeflag)

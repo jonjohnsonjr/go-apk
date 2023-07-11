@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -54,6 +55,11 @@ type APKExpanded struct {
 
 	sync.Mutex
 	packageData io.ReadCloser
+
+	HeaderFile string
+
+	// TODO: Make this not bad.
+	InstalledFiles []tar.Header
 }
 
 const meg = 1 << 20
@@ -287,6 +293,10 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 	if err != nil {
 		return nil, err
 	}
+	headerFile, err := os.Create(filepath.Join(dir, "headers"))
+	if err != nil {
+		return nil, fmt.Errorf("creating header file: %w", err)
+	}
 
 	sw, err := newExpandApkWriter(dir, "stream", "tar.gz")
 	if err != nil {
@@ -338,7 +348,8 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 			hashes = append(hashes, h.Sum(nil))
 			gzipStreams = append(gzipStreams, sw.CurrentName())
 		} else {
-			if err := checkSums(ctx, gzi); err != nil {
+
+			if err := checkSums(ctx, gzi, headerFile); err != nil {
 				return nil, fmt.Errorf("checking sums: %w", err)
 			}
 			if _, err := io.Copy(io.Discard, gzi); err != nil {
@@ -390,6 +401,7 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 		ControlHash: hashes[controlDataIndex],
 		PackageFile: gzipStreams[controlDataIndex+1],
 		PackageHash: hashes[controlDataIndex+1],
+		HeaderFile:  headerFile.Name(),
 	}
 	if signed {
 		expanded.SignatureFile = gzipStreams[0]
@@ -398,9 +410,13 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 	return &expanded, nil
 }
 
-func checkSums(ctx context.Context, r io.Reader) error {
+func checkSums(ctx context.Context, r io.Reader, f *os.File) error {
 	ctx, span := otel.Tracer("go-apk").Start(ctx, "checkSums")
 	defer span.End()
+
+	bw := bufio.NewWriterSize(f, 1<<20)
+	zw := gzip.NewWriter(bw)
+	enc := json.NewEncoder(zw)
 
 	tr := tar.NewReader(r)
 
@@ -411,6 +427,10 @@ func checkSums(ctx context.Context, r io.Reader) error {
 		}
 		if err != nil {
 			return err
+		}
+
+		if err := enc.Encode(header); err != nil {
+			return fmt.Errorf("writing %s header: %w", header.Name, err)
 		}
 
 		if header.Typeflag != tar.TypeReg {
@@ -436,6 +456,14 @@ func checkSums(ctx context.Context, r io.Reader) error {
 		if want, got := checksum, w.Sum(nil); !bytes.Equal(want, got) {
 			return fmt.Errorf("checksum mismatch: %s header was %x, computed %x", header.Name, want, got)
 		}
+	}
+
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("closing gzip writer for header file %q: %w", f.Name(), err)
+	}
+
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("flushing header file %q: %w", f.Name(), err)
 	}
 
 	return nil

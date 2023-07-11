@@ -515,6 +515,17 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 
 				pkg := allpkgs[i]
 
+				// TODO: virtualFS
+				// serial {
+				//   Install dirs and symlinks
+				//   Create map[filename]pkg
+				//   error on any conflicts (todo: resolve them)
+				// }
+				//
+				// parallel {
+				//   installFiles
+				// }
+
 				if err := a.installPackage(gctx, pkg, exp, sourceDateEpoch); err != nil {
 					return fmt.Errorf("installing %s: %w", pkg.Name, err)
 				}
@@ -551,6 +562,10 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 			// Start gunzipping this ahead of time so we can install it faster.
 			// We may want to tune these numbers a bit based on package size or count.
 			exp.SetPackageData(readahead.NewReadCloser(pd))
+
+			if err := a.installPackageFiles(gctx, pkg, exp, sourceDateEpoch); err != nil {
+				return fmt.Errorf("installing %s: %w", pkg.Name, err)
+			}
 
 			expanded[i] = exp
 			close(done[i])
@@ -679,6 +694,16 @@ func (a *APK) cachePackage(ctx context.Context, pkg *repository.RepositoryPackag
 	}
 
 	exp.PackageFile = datDst
+
+	if exp.HeaderFile != "" {
+		hdrDst := filepath.Join(cacheDir, datHex+".hdr.jsonl.gz")
+
+		if err := os.Rename(exp.HeaderFile, hdrDst); err != nil {
+			return nil, fmt.Errorf("renaming header file: %w", err)
+		}
+
+		exp.HeaderFile = hdrDst
+	}
 
 	return exp, nil
 }
@@ -857,11 +882,10 @@ func (a *APK) fetchPackage(ctx context.Context, pkg *repository.RepositoryPackag
 	}
 }
 
-// installPackage installs a single package and updates installed db.
-func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded, sourceDateEpoch *time.Time) error {
+func (a *APK) installPackageFiles(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded, sourceDateEpoch *time.Time) error {
 	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
 
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "installPackage", trace.WithAttributes(attribute.String("package", pkg.Name)))
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "installPackageFiles", trace.WithAttributes(attribute.String("package", pkg.Name)))
 	defer span.End()
 
 	defer expanded.Close()
@@ -876,6 +900,15 @@ func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPack
 	if err != nil {
 		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
 	}
+
+	expanded.InstalledFiles = installedFiles
+	return nil
+}
+
+// installPackage installs a single package and updates installed db.
+func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded, sourceDateEpoch *time.Time) error {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "installPackage", trace.WithAttributes(attribute.String("package", pkg.Name)))
+	defer span.End()
 
 	// update the scripts.tar
 	controlData, err := os.Open(expanded.ControlFile)
@@ -896,7 +929,7 @@ func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPack
 	}
 
 	// update the installed file
-	if err := a.addInstalledPackage(pkg.Package, installedFiles); err != nil {
+	if err := a.addInstalledPackage(pkg.Package, expanded.InstalledFiles); err != nil {
 		return fmt.Errorf("unable to update installed file for pkg %s: %w", pkg.Name, err)
 	}
 	return nil
