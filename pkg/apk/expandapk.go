@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/klauspost/compress/gzip"
 
@@ -52,23 +51,16 @@ type APKExpanded struct {
 	ControlHash []byte
 	PackageHash []byte
 
-	sync.Mutex
 	packageData io.ReadCloser
 }
 
 const meg = 1 << 20
 
 func (a *APKExpanded) SetPackageData(rc io.ReadCloser) {
-	a.Lock()
-	defer a.Unlock()
-
 	a.packageData = rc
 }
 
 func (a *APKExpanded) PackageData() (io.ReadCloser, error) {
-	a.Lock()
-	defer a.Unlock()
-
 	if a.packageData != nil {
 		rc := a.packageData
 		a.packageData = nil

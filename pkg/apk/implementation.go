@@ -38,6 +38,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/sys/unix"
 
 	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
@@ -745,20 +746,42 @@ func (a *APK) cachedPackage(ctx context.Context, pkg *repository.RepositoryPacka
 	return &exp, nil
 }
 
+// TODO: Revisit this global.
+// This deduplicates in-flight work in a single process to avoid fetching or expanding the same thing twice.
+// It would be better if this was not a global, but the cache is also global (host filesystem), so /shrug.
+// Maybe we should use file locking so multiple processes can coordinate, but that seems really complex.
+var cacheFlight singleflight.Group
+
 func (a *APK) expandPackage(ctx context.Context, pkg *repository.RepositoryPackage) (*APKExpanded, error) {
 	ctx, span := otel.Tracer("go-apk").Start(ctx, "expandPackage", trace.WithAttributes(attribute.String("package", pkg.Name)))
 	defer span.End()
 
-	cacheDir := ""
-	if a.cache != nil {
-		var err error
-		cacheDir, err = cacheDirForPackage(a.cache.dir, pkg)
+	cacheMiss := func(ctx context.Context, pkg *repository.RepositoryPackage, cacheDir string) (*APKExpanded, error) {
+		rc, err := a.fetchPackage(ctx, pkg)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetching package %q: %w", pkg.Name, err)
+		}
+		defer rc.Close()
+
+		exp, err := ExpandApk(ctx, rc, cacheDir)
+		if err != nil {
+			return nil, fmt.Errorf("expanding %s: %w", pkg.Name, err)
 		}
 
-		exp, err := a.cachedPackage(ctx, pkg, cacheDir)
-		if err == nil {
+		return exp, nil
+	}
+
+	if a.cache == nil {
+		return cacheMiss(ctx, pkg, "")
+	}
+
+	cacheDir, err := cacheDirForPackage(a.cache.dir, pkg)
+	if err != nil {
+		return nil, err
+	}
+
+	v, err, shared := cacheFlight.Do(cacheDir, func() (interface{}, error) {
+		if exp, err := a.cachedPackage(ctx, pkg, cacheDir); err == nil {
 			a.logger.Debugf("cache hit (%s)", pkg.Name)
 			return exp, nil
 		}
@@ -768,25 +791,26 @@ func (a *APK) expandPackage(ctx context.Context, pkg *repository.RepositoryPacka
 		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 			return nil, fmt.Errorf("unable to create cache directory %q: %w", cacheDir, err)
 		}
-	}
 
-	rc, err := a.fetchPackage(ctx, pkg)
+		exp, err := cacheMiss(ctx, pkg, cacheDir)
+		if err != nil {
+			return nil, err
+		}
+
+		return a.cachePackage(ctx, pkg, exp, cacheDir)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("fetching package %q: %w", pkg.Name, err)
-	}
-	defer rc.Close()
-
-	exp, err := ExpandApk(ctx, rc, cacheDir)
-	if err != nil {
-		return nil, fmt.Errorf("expanding %s: %w", pkg.Name, err)
+		return nil, err
 	}
 
-	// If we don't have a cache, we're done.
-	if a.cache == nil {
-		return exp, nil
+	exp := v.(*APKExpanded)
+	if shared {
+		// If multiple things were waiting on this, make a copy so they each get their own.
+		copied := *exp
+		return &copied, nil
 	}
 
-	return a.cachePackage(ctx, pkg, exp, cacheDir)
+	return exp, nil
 }
 
 func packageAsURI(pkg *repository.RepositoryPackage) (uri.URI, error) {
