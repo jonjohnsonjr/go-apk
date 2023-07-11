@@ -55,20 +55,9 @@ type APKExpanded struct {
 	PackageHash []byte
 }
 
-// This exists so we can have a bufio.ReadCloser.
-type readCloser struct {
-	io.Reader
-	CloseFunc func() error
-}
-
-// Close implements io.ReadCloser
-func (rc *readCloser) Close() error {
-	return rc.CloseFunc()
-}
-
 const meg = 1 << 20
 
-func (a *APKExpanded) PackageData() (io.ReadCloser, error) {
+func (a *APKExpanded) PackageData() (io.ReadSeekCloser, error) {
 	// Use min(1MB, a.Size) bufio to avoid GC pressure for small packages.
 	bufSize := meg
 	if total := int(a.Size); total != 0 && total < bufSize {
@@ -77,10 +66,7 @@ func (a *APKExpanded) PackageData() (io.ReadCloser, error) {
 
 	uf, err := os.Open(a.tarFile)
 	if err == nil {
-		return &readCloser{
-			Reader:    bufio.NewReaderSize(uf, bufSize),
-			CloseFunc: uf.Close,
-		}, nil
+		return uf, nil
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("opening package data file: %w", err)
 	}
@@ -101,24 +87,17 @@ func (a *APKExpanded) PackageData() (io.ReadCloser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening tar file %q: %w", a.tarFile, err)
 	}
-	bw := bufio.NewWriterSize(uf, 1<<20)
-	if _, err := io.Copy(bw, zr); err != nil {
-		return nil, fmt.Errorf("expanding %q: %w", a.PackageFile, err)
-	}
-	if err := bw.Flush(); err != nil {
-		return nil, fmt.Errorf("flushing %q: %w", a.tarFile, err)
+
+	buf := make([]byte, bufSize)
+	if _, err := io.CopyBuffer(uf, zr, buf); err != nil {
+		return nil, fmt.Errorf("decompressing %q: %w", a.PackageFile, err)
 	}
 
-	if _, err := uf.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("seeking %q: %w", a.tarFile, err)
+	if err := uf.Close(); err != nil {
+		return nil, fmt.Errorf("closing %q: %w", a.tarFile, err)
 	}
 
-	br.Reset(uf)
-
-	return &readCloser{
-		Reader:    br,
-		CloseFunc: uf.Close,
-	}, nil
+	return os.Open(a.tarFile)
 }
 
 func (a *APKExpanded) APK() (io.ReadCloser, error) {
@@ -389,6 +368,7 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 			if err := tarfile.Close(); err != nil {
 				return nil, fmt.Errorf("closing tarfile: %w", err)
 			}
+
 			gzipStreams = append(gzipStreams, sw.CurrentName())
 			hashes = append(hashes, h.Sum(nil))
 			break

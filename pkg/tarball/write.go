@@ -230,7 +230,12 @@ func (c *Context) writeTar(ctx context.Context, tw *tar.Writer, fsys fs.FS, user
 				fileChecksum := hex.EncodeToString(fileDigest.Sum(nil))
 				header.PAXRecords["APK-TOOLS.checksum.SHA1"] = fileChecksum
 			}
+		} else {
+			delete(header.PAXRecords, "APK-TOOLS.checksum.SHA1")
 		}
+
+		// tw.WriteHeader will take care of this if it's necessary.
+		delete(header.PAXRecords, "path")
 
 		xfs, ok := fsys.(apkfs.XattrFS)
 		if ok {
@@ -244,7 +249,7 @@ func (c *Context) writeTar(ctx context.Context, tw *tar.Writer, fsys fs.FS, user
 		}
 
 		if err := tw.WriteHeader(header); err != nil {
-			return err
+			return fmt.Errorf("calling WriteHeader on %s: %w", header.Name, err)
 		}
 
 		if info.Mode().IsRegular() && header.Size > 0 {
@@ -256,7 +261,7 @@ func (c *Context) writeTar(ctx context.Context, tw *tar.Writer, fsys fs.FS, user
 			defer data.Close()
 
 			if _, err := io.CopyBuffer(tw, data, buf); err != nil {
-				return err
+				return fmt.Errorf("copying %s: %w", header.Name, err)
 			}
 		}
 
@@ -305,8 +310,14 @@ func (c *Context) WriteTar(ctx context.Context, dst io.Writer, src fs.FS) error 
 	}
 
 	// get the uname and gname maps
-	usersFile, _ := passwd.ReadUserFile(src, "etc/passwd")
-	groupsFile, _ := passwd.ReadGroupFile(src, "etc/group")
+	usersFile, err := passwd.ReadUserFile(src, "etc/passwd")
+	if err != nil {
+		return err
+	}
+	groupsFile, err := passwd.ReadGroupFile(src, "etc/group")
+	if err != nil {
+		return err
+	}
 	users := map[int]string{}
 	groups := map[int]string{}
 	for _, u := range usersFile.Entries {

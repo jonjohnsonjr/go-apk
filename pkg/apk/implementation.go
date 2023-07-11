@@ -40,7 +40,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 
-	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
 	logger "github.com/chainguard-dev/go-apk/pkg/logger"
 	"github.com/hashicorp/go-retryablehttp"
 )
@@ -49,7 +48,7 @@ type APK struct {
 	arch              string
 	version           string
 	logger            logger.Logger
-	fs                apkfs.FullFS
+	fs                FullFS
 	executor          Executor
 	ignoreMknodErrors bool
 	client            *http.Client
@@ -64,8 +63,10 @@ func New(options ...Option) (*APK, error) {
 			return nil, err
 		}
 	}
+
 	return &APK{
-		fs:                opt.fs,
+		// TODO: NOT THIS.
+		fs:                NewMemFS(),
 		logger:            opt.logger,
 		arch:              opt.arch,
 		executor:          opt.executor,
@@ -449,7 +450,7 @@ func (a *APK) ResolveWorld(ctx context.Context) (toInstall []*repository.Reposit
 }
 
 // FixateWorld force apk's resolver to re-resolve the requested dependencies in /etc/apk/world.
-func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error {
+func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) (FullFS, error) {
 	/*
 		equivalent of: "apk fix --arch arch --root root"
 		with possible options for --no-scripts, --no-cache, --update-cache
@@ -465,7 +466,7 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 	// 1. Get the apkIndexes for each repository for the target arch
 	allpkgs, conflicts, err := a.ResolveWorld(ctx)
 	if err != nil {
-		return fmt.Errorf("error getting package dependencies: %w", err)
+		return nil, fmt.Errorf("error getting package dependencies: %w", err)
 	}
 
 	// 3. For each name on the list:
@@ -478,10 +479,10 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 	for _, pkg := range conflicts {
 		isInstalled, err := a.isInstalledPackage(pkg)
 		if err != nil {
-			return fmt.Errorf("error checking if package %s is installed: %w", pkg, err)
+			return nil, fmt.Errorf("error checking if package %s is installed: %w", pkg, err)
 		}
 		if isInstalled {
-			return fmt.Errorf("cannot install due to conflict with %s", pkg)
+			return nil, fmt.Errorf("cannot install due to conflict with %s", pkg)
 		}
 	}
 
@@ -553,10 +554,10 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 	}
 
 	if err := g.Wait(); err != nil {
-		return fmt.Errorf("installing packages: %w", err)
+		return nil, fmt.Errorf("installing packages: %w", err)
 	}
 
-	return nil
+	return a.fs, nil
 }
 
 type NoKeysFoundError struct {
@@ -874,9 +875,10 @@ func (a *APK) installPackage(ctx context.Context, pkg *repository.RepositoryPack
 	if err != nil {
 		return fmt.Errorf("opening package file %q: %w", expanded.PackageFile, err)
 	}
-	defer packageData.Close()
+	// TODO: Reconcile thils.
+	// defer packageData.Close()
 
-	installedFiles, err := a.installAPKFiles(ctx, packageData, pkg.Origin, pkg.Replaces)
+	installedFiles, err := a.installAPKFiles(ctx, packageData, pkg.Package)
 	if err != nil {
 		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
 	}
