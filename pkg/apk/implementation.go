@@ -1020,7 +1020,7 @@ func (a *APK) installPackageFiles2(ctx context.Context, pkg *repository.Reposito
 		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
 	}
 
-	expanded.InstalledFiles = installedFiles
+	expanded.InstalledFiles = append(expanded.InstalledFiles, installedFiles...)
 	return nil
 }
 

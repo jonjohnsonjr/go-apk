@@ -347,134 +347,135 @@ func (a *APK) installRegAndLinks(ctx context.Context, in io.Reader, origin, repl
 		// whatever it is now, it is in the data section
 		startedDataSection = true
 
-		if header.Typeflag == tar.TypeLink {
+		switch header.Typeflag {
+		case tar.TypeLink:
 			if err := a.fs.Link(header.Linkname, header.Name); err != nil {
 				return nil, err
 			}
-		} else if header.Typeflag != tar.TypeReg {
-			continue
-		}
-
-		// We trust this because we verify it earlier in ExpandAPK.
-		checksum, err := checksumFromHeader(header)
-		if err != nil {
-			return nil, err
-		}
-
-		found := false
-		// TODO: Should this iterate backwards?
-		for i, depHeaders := range indexes {
-			if extant, ok := depHeaders[header.Name]; ok {
-				extantCheck, ok := extant.PAXRecords[paxRecordsChecksumKey]
-				if !ok {
-					return nil, fmt.Errorf("file %q in dep %d missing checksum", extant.Name, i)
-				}
-				hdrCheck, ok := header.PAXRecords[paxRecordsChecksumKey]
-				if !ok {
-					return nil, fmt.Errorf("file %q missing checksum", header.Name)
-				}
-
-				if extantCheck != hdrCheck {
-					return nil, fmt.Errorf("checksum mismatch for %q: %q != %q", header.Name, extantCheck, hdrCheck)
-				}
-
-				// TODO: Check for different metadata.
-				found = true
-				break
-			}
-		}
-
-		if found {
-			continue
-		}
-
-		var r io.Reader = tr
-
-		if checksum == nil {
-			// There was no checksum header, which is unexpected, but we can just recalculate it.
-
-			w := sha1.New() //nolint:gosec // this is what apk tools is using
-			tee := io.TeeReader(tr, w)
-
-			// we need to calculate the checksum of the file, and then pass it to the writeOneFile,
-			// so we save it to a tempdir and then remove it
-			f, err := os.CreateTemp(tmpDir, "apk-file")
+		case tar.TypeReg:
+			// We trust this because we verify it earlier in ExpandAPK.
+			checksum, err := checksumFromHeader(header)
 			if err != nil {
-				return nil, fmt.Errorf("error creating temporary file: %w", err)
-			}
-
-			if _, err := io.Copy(f, tee); err != nil {
-				return nil, fmt.Errorf("error copying file %s: %w", header.Name, err)
-			}
-			offset, err := f.Seek(0, io.SeekStart)
-			if err != nil {
-				return nil, fmt.Errorf("error seeking to start of temp file for %s: %w", header.Name, err)
-			}
-			if offset != 0 {
-				return nil, fmt.Errorf("error seeking to start of temp file for %s: offset is %d", header.Name, offset)
-			}
-			checksum = w.Sum(nil)
-
-			r = f
-		}
-
-		if err := a.writeOneFile(header, r, false); err != nil {
-			// if the error is something other than the file exists, return the error
-			var fileExistsError FileExistsError
-			if !errors.As(err, &fileExistsError) || origin == "" {
 				return nil, err
 			}
-			// if the two files are identical, no need to overwrite, but we will keep the first one
-			// that wrote it, which might be the base system or an earlier package
-			if bytes.Equal(checksum, fileExistsError.Sha1) {
-				continue
-			}
 
-			// they are not identical,
-			// compare the origin of the package that we are installing now, to the origin of the package
-			// that provided the file. If the origins are the same, then we can allow the
-			// overwrite. Otherwise, we need to return an error.
-			installed, err := a.GetInstalled()
-			if err != nil {
-				return nil, fmt.Errorf("unable to get list of installed packages and files: %w", err)
-			}
-			// go through each installed, looking for those that match our origin
-			var found bool
-			for _, pkg := range installed {
-				// if it is not the same origin or isn't a replacement, we are not interested
-				if pkg.Origin != origin && pkg.Name != replaces {
-					continue
-				}
-				// matched the origin (or is a replacement), so look for the file we are installing
-				for _, file := range pkg.Files {
-					if file.Name == header.Name {
-						found = true
-						break
+			found := false
+			// TODO: Should this iterate backwards?
+			for i, depHeaders := range indexes {
+				if extant, ok := depHeaders[header.Name]; ok {
+					extantCheck, ok := extant.PAXRecords[paxRecordsChecksumKey]
+					if !ok {
+						return nil, fmt.Errorf("file %q in dep %d missing checksum", extant.Name, i)
 					}
-				}
-				if found {
+					hdrCheck, ok := header.PAXRecords[paxRecordsChecksumKey]
+					if !ok {
+						return nil, fmt.Errorf("file %q missing checksum", header.Name)
+					}
+
+					if extantCheck != hdrCheck {
+						return nil, fmt.Errorf("checksum mismatch for %q: %q != %q", header.Name, extantCheck, hdrCheck)
+					}
+
+					// TODO: Check for different metadata.
+					found = true
 					break
 				}
 			}
-			if !found {
-				return nil, fmt.Errorf("unable to install file over existing one, different contents: %s", header.Name)
-			}
-			// it was found in a package with the same origin, so just overwrite
 
-			// if we get here, it had the same origin so even if different, we are allowed to overwrite the file
-			if err := a.writeOneFile(header, r, true); err != nil {
-				return nil, err
+			if found {
+				continue
 			}
-		}
 
-		// we need to save this somewhere. The output expects []tar.Header, so we need to override that.
-		// Reusing a field should be good enough, provided that we know it is not getting in the way of
-		// anything downstream. Since we know it is not, this is good enough.
-		if header.PAXRecords == nil {
-			header.PAXRecords = make(map[string]string)
+			var r io.Reader = tr
+
+			if checksum == nil {
+				// There was no checksum header, which is unexpected, but we can just recalculate it.
+
+				w := sha1.New() //nolint:gosec // this is what apk tools is using
+				tee := io.TeeReader(tr, w)
+
+				// we need to calculate the checksum of the file, and then pass it to the writeOneFile,
+				// so we save it to a tempdir and then remove it
+				f, err := os.CreateTemp(tmpDir, "apk-file")
+				if err != nil {
+					return nil, fmt.Errorf("error creating temporary file: %w", err)
+				}
+
+				if _, err := io.Copy(f, tee); err != nil {
+					return nil, fmt.Errorf("error copying file %s: %w", header.Name, err)
+				}
+				offset, err := f.Seek(0, io.SeekStart)
+				if err != nil {
+					return nil, fmt.Errorf("error seeking to start of temp file for %s: %w", header.Name, err)
+				}
+				if offset != 0 {
+					return nil, fmt.Errorf("error seeking to start of temp file for %s: offset is %d", header.Name, offset)
+				}
+				checksum = w.Sum(nil)
+
+				r = f
+			}
+
+			if err := a.writeOneFile(header, r, false); err != nil {
+				// if the error is something other than the file exists, return the error
+				var fileExistsError FileExistsError
+				if !errors.As(err, &fileExistsError) || origin == "" {
+					return nil, err
+				}
+				// if the two files are identical, no need to overwrite, but we will keep the first one
+				// that wrote it, which might be the base system or an earlier package
+				if bytes.Equal(checksum, fileExistsError.Sha1) {
+					continue
+				}
+
+				// they are not identical,
+				// compare the origin of the package that we are installing now, to the origin of the package
+				// that provided the file. If the origins are the same, then we can allow the
+				// overwrite. Otherwise, we need to return an error.
+				installed, err := a.GetInstalled()
+				if err != nil {
+					return nil, fmt.Errorf("unable to get list of installed packages and files: %w", err)
+				}
+				// go through each installed, looking for those that match our origin
+				var found bool
+				for _, pkg := range installed {
+					// if it is not the same origin or isn't a replacement, we are not interested
+					if pkg.Origin != origin && pkg.Name != replaces {
+						continue
+					}
+					// matched the origin (or is a replacement), so look for the file we are installing
+					for _, file := range pkg.Files {
+						if file.Name == header.Name {
+							found = true
+							break
+						}
+					}
+					if found {
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("unable to install file over existing one, different contents: %s", header.Name)
+				}
+				// it was found in a package with the same origin, so just overwrite
+
+				// if we get here, it had the same origin so even if different, we are allowed to overwrite the file
+				if err := a.writeOneFile(header, r, true); err != nil {
+					return nil, err
+				}
+			}
+
+			// we need to save this somewhere. The output expects []tar.Header, so we need to override that.
+			// Reusing a field should be good enough, provided that we know it is not getting in the way of
+			// anything downstream. Since we know it is not, this is good enough.
+			if header.PAXRecords == nil {
+				header.PAXRecords = make(map[string]string)
+			}
+			// apk installed db uses this format
+			header.PAXRecords[paxRecordsChecksumKey] = fmt.Sprintf("Q1%s", base64.StdEncoding.EncodeToString(checksum))
+		default:
+			continue
 		}
-		// apk installed db uses this format
-		header.PAXRecords[paxRecordsChecksumKey] = fmt.Sprintf("Q1%s", base64.StdEncoding.EncodeToString(checksum))
 
 		// xattrs
 		for k, v := range header.PAXRecords {
@@ -518,6 +519,8 @@ func (a *APK) installSymlinksAndDirs(ctx context.Context, pkg *repository.Reposi
 
 	dec := json.NewDecoder(zr)
 
+	installed := []tar.Header{}
+
 	for {
 		header := tar.Header{}
 
@@ -556,6 +559,7 @@ func (a *APK) installSymlinksAndDirs(ctx context.Context, pkg *repository.Reposi
 					return nil, fmt.Errorf("error setting xattr %s on %s: %w", attrName, header.Name, err)
 				}
 			}
+			installed = append(installed, header)
 		case tar.TypeSymlink:
 			// some underlying filesystems and some memfs that we use in tests do not support symlinks.
 			// attempt it, and if it fails, just copy it.
@@ -566,6 +570,7 @@ func (a *APK) installSymlinksAndDirs(ctx context.Context, pkg *repository.Reposi
 			if err := a.fs.Symlink(header.Linkname, header.Name); err != nil {
 				return nil, fmt.Errorf("unable to install symlink from %s -> %s: %w", header.Name, header.Linkname, err)
 			}
+			installed = append(installed, header)
 		case tar.TypeReg, tar.TypeLink:
 			// We deal with these later.
 			continue
@@ -573,6 +578,8 @@ func (a *APK) installSymlinksAndDirs(ctx context.Context, pkg *repository.Reposi
 			return nil, fmt.Errorf("unsupported file type %s %v", header.Name, header.Typeflag)
 		}
 	}
+
+	expanded.InstalledFiles = append(expanded.InstalledFiles, installed...)
 
 	return headers, nil
 }
