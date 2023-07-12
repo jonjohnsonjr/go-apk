@@ -25,12 +25,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"gitlab.alpinelinux.org/alpine/go/pkg/repository"
@@ -492,6 +494,10 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 
 	expanded := make([]*APKExpanded, len(allpkgs))
 
+	for _, pkg := range allpkgs {
+		log.Printf("pkg: %s", pkg.Name)
+	}
+
 	// A slice of pseudo-promises that get closed when expanded[i] is ready.
 	done := make([]chan struct{}, len(allpkgs))
 	for i := range allpkgs {
@@ -502,6 +508,8 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 	// overlays := []map[string]tar.Header{}
 
 	indexes := make([]map[string]tar.Header, len(expanded))
+
+	onces := make([]sync.Once, len(expanded))
 
 	// Kick off a goroutine that sequentially installs packages as they become ready.
 	//
@@ -519,6 +527,26 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 			pkgIdx, pkg := pkgIdx, pkg
 
 			installers.Go(func() error {
+				// Determine if we have any conflicts.
+				// TODO: Also resolve symlinks.
+				for i, ch := range done[:pkgIdx] {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-ch:
+						if exp := expanded[i]; exp == nil {
+							continue
+						} else {
+							var err error
+							onces[i].Do(func() {
+								indexes[i], err = a.installSymlinksAndDirs(ctx, allpkgs[i], exp)
+							})
+							if err != nil {
+								return err
+							}
+						}
+					}
+				}
 
 				// Wait for this thing to be done.
 				ch := done[pkgIdx]
@@ -531,44 +559,16 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 					}
 				}
 				exp := expanded[pkgIdx]
+
+				var err error
+				onces[pkgIdx].Do(func() {
+					indexes[pkgIdx], err = a.installSymlinksAndDirs(ctx, allpkgs[pkgIdx], exp)
+				})
+				if err != nil {
+					return err
+				}
+
 				headers := indexes[pkgIdx]
-
-				// Determine if we have any conflicts.
-				// TODO: Also resolve symlinks.
-				for i, ch := range done[:pkgIdx] {
-					select {
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-ch:
-						if expanded[i] == nil {
-							continue
-						}
-					}
-				}
-
-				for i, depHeaders := range indexes[:pkgIdx] {
-					for filename, hdr := range headers {
-						if hdr.Typeflag != tar.TypeReg {
-							// TODO: Handle other types?
-							continue
-						}
-
-						if extant, ok := depHeaders[filename]; ok {
-							extantCheck, ok := extant.PAXRecords[paxRecordsChecksumKey]
-							if !ok {
-								return fmt.Errorf("file %q in package %q missing checksum", extant.Name, allpkgs[i].Name)
-							}
-							hdrCheck, ok := hdr.PAXRecords[paxRecordsChecksumKey]
-							if !ok {
-								return fmt.Errorf("file %q in package %q missing checksum", extant.Name, pkg.Name)
-							}
-
-							if extantCheck != hdrCheck {
-								return fmt.Errorf("checksum mismatch for %q: pkg[%q] = %q, pkg[%q] = %q", hdr.Name, allpkgs[i].Name, extantCheck, pkg.Name, hdrCheck)
-							}
-						}
-					}
-				}
 
 				if err := a.installPackageFiles2(ctx, pkg, exp, sourceDateEpoch, headers, indexes[:pkgIdx]); err != nil {
 					return fmt.Errorf("installing %s: %w", pkg.Name, err)
@@ -620,12 +620,6 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 				// We may want to tune these numbers a bit based on package size or count.
 				exp.SetPackageData(readahead.NewReadCloser(pd))
 
-				headers, err := a.indexFiles(ctx, pkg, exp)
-				if err != nil {
-					return fmt.Errorf("indexing %q: %w", pkg.Name, err)
-				}
-
-				indexes[i] = headers
 				expanded[i] = exp
 
 				close(done[i])
@@ -1010,7 +1004,7 @@ func (a *APK) indexFiles(ctx context.Context, pkg *repository.RepositoryPackage,
 func (a *APK) installPackageFiles2(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded, sourceDateEpoch *time.Time, headers map[string]tar.Header, indexes []map[string]tar.Header) error {
 	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
 
-	ctx, span := otel.Tracer("go-apk").Start(ctx, "installPackageFiles", trace.WithAttributes(attribute.String("package", pkg.Name)))
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "installPackageFiles2", trace.WithAttributes(attribute.String("package", pkg.Name)))
 	defer span.End()
 
 	defer expanded.Close()
@@ -1021,7 +1015,7 @@ func (a *APK) installPackageFiles2(ctx context.Context, pkg *repository.Reposito
 	}
 	defer packageData.Close()
 
-	installedFiles, err := a.installAPKFiles2(ctx, packageData, pkg.Origin, pkg.Replaces, headers, indexes)
+	installedFiles, err := a.installRegAndLinks(ctx, packageData, pkg.Origin, pkg.Replaces, headers, indexes)
 	if err != nil {
 		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
 	}
