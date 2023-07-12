@@ -16,6 +16,7 @@ package apk
 
 import (
 	"archive/tar"
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -43,6 +44,7 @@ import (
 	apkfs "github.com/chainguard-dev/go-apk/pkg/fs"
 	logger "github.com/chainguard-dev/go-apk/pkg/logger"
 	"github.com/hashicorp/go-retryablehttp"
+	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/readahead"
 )
 
@@ -486,8 +488,7 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 	// TODO: Consider making this configurable option.
 	jobs := runtime.GOMAXPROCS(0)
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(jobs + 1)
+	var g errgroup.Group
 
 	expanded := make([]*APKExpanded, len(allpkgs))
 
@@ -497,85 +498,162 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 		done[i] = make(chan struct{})
 	}
 
+	// onces := make([]sync.Once, len(expanded))
+	// overlays := []map[string]tar.Header{}
+
+	indexes := make([]map[string]tar.Header, len(expanded))
+
 	// Kick off a goroutine that sequentially installs packages as they become ready.
 	//
 	// We could probably do better than this by mirroring the dependency graph or even
 	// just computing non-overlapping packages based on the installed files, but we'll
 	// keep this simple for now by assuming we must install in the given order exactly.
+	var installers errgroup.Group
+	installers.SetLimit(jobs)
+
 	g.Go(func() error {
-		for i, ch := range done {
-			select {
-			case <-gctx.Done():
-				return gctx.Err()
-			case <-ch:
-				exp := expanded[i]
-				if exp == nil {
-					continue
+		ctx, span := otel.Tracer("go-apk").Start(ctx, "installers")
+		defer span.End()
+
+		for pkgIdx, pkg := range allpkgs {
+			pkgIdx, pkg := pkgIdx, pkg
+
+			installers.Go(func() error {
+
+				// Wait for this thing to be done.
+				ch := done[pkgIdx]
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-ch:
+					if expanded[pkgIdx] == nil {
+						return nil
+					}
+				}
+				exp := expanded[pkgIdx]
+				headers := indexes[pkgIdx]
+
+				// Determine if we have any conflicts.
+				// TODO: Also resolve symlinks.
+				for i, ch := range done[:pkgIdx] {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-ch:
+						if expanded[i] == nil {
+							continue
+						}
+					}
 				}
 
-				pkg := allpkgs[i]
+				for i, depHeaders := range indexes[:pkgIdx] {
+					for filename, hdr := range headers {
+						if hdr.Typeflag != tar.TypeReg {
+							// TODO: Handle other types?
+							continue
+						}
 
-				// TODO: virtualFS
-				// serial {
-				//   Install dirs and symlinks
-				//   Create map[filename]pkg
-				//   error on any conflicts (todo: resolve them)
-				// }
-				//
-				// parallel {
-				//   installFiles
-				// }
+						if extant, ok := depHeaders[filename]; ok {
+							extantCheck, ok := extant.PAXRecords[paxRecordsChecksumKey]
+							if !ok {
+								return fmt.Errorf("file %q in package %q missing checksum", extant.Name, allpkgs[i].Name)
+							}
+							hdrCheck, ok := hdr.PAXRecords[paxRecordsChecksumKey]
+							if !ok {
+								return fmt.Errorf("file %q in package %q missing checksum", extant.Name, pkg.Name)
+							}
 
-				if err := a.installPackage(gctx, pkg, exp, sourceDateEpoch); err != nil {
+							if extantCheck != hdrCheck {
+								return fmt.Errorf("checksum mismatch for %q: pkg[%q] = %q, pkg[%q] = %q", hdr.Name, allpkgs[i].Name, extantCheck, pkg.Name, hdrCheck)
+							}
+						}
+					}
+				}
+
+				if err := a.installPackageFiles2(ctx, pkg, exp, sourceDateEpoch, headers, indexes[:pkgIdx]); err != nil {
 					return fmt.Errorf("installing %s: %w", pkg.Name, err)
 				}
-			}
+
+				return nil
+			})
+		}
+
+		if err := installers.Wait(); err != nil {
+			return fmt.Errorf("installing packages: %w", err)
 		}
 
 		return nil
 	})
 
+	var expanders errgroup.Group
+	expanders.SetLimit(jobs)
+
 	// Meanwhile, concurrently fetch and expand all our APKs.
 	// We signal they are ready to be installed by closing done[i].
-	for i, pkg := range allpkgs {
-		i, pkg := i, pkg
+	g.Go(func() error {
+		ctx, span := otel.Tracer("go-apk").Start(ctx, "expanders")
+		defer span.End()
 
-		g.Go(func() error {
-			isInstalled, err := a.isInstalledPackage(pkg.Name)
-			if err != nil {
-				return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
-			}
-			if isInstalled {
+		for i, pkg := range allpkgs {
+			i, pkg := i, pkg
+
+			expanders.Go(func() error {
+				isInstalled, err := a.isInstalledPackage(pkg.Name)
+				if err != nil {
+					return fmt.Errorf("error checking if package %s is installed: %w", pkg.Name, err)
+				}
+				if isInstalled {
+					return nil
+				}
+
+				exp, err := a.expandPackage(ctx, pkg)
+				if err != nil {
+					return fmt.Errorf("expanding %s: %w", pkg.Name, err)
+				}
+
+				pd, err := exp.PackageData()
+				if err != nil {
+					return fmt.Errorf("package data: %w", err)
+				}
+
+				// Start gunzipping this ahead of time so we can install it faster.
+				// We may want to tune these numbers a bit based on package size or count.
+				exp.SetPackageData(readahead.NewReadCloser(pd))
+
+				headers, err := a.indexFiles(ctx, pkg, exp)
+				if err != nil {
+					return fmt.Errorf("indexing %q: %w", pkg.Name, err)
+				}
+
+				indexes[i] = headers
+				expanded[i] = exp
+
+				close(done[i])
+
 				return nil
-			}
+			})
+		}
 
-			exp, err := a.expandPackage(gctx, pkg)
-			if err != nil {
-				return fmt.Errorf("expanding %s: %w", pkg.Name, err)
-			}
+		if err := expanders.Wait(); err != nil {
+			return fmt.Errorf("expanding packages: %w", err)
+		}
 
-			pd, err := exp.PackageData()
-			if err != nil {
-				return fmt.Errorf("package data: %w", err)
-			}
-
-			// Start gunzipping this ahead of time so we can install it faster.
-			// We may want to tune these numbers a bit based on package size or count.
-			exp.SetPackageData(readahead.NewReadCloser(pd))
-
-			if err := a.installPackageFiles(gctx, pkg, exp, sourceDateEpoch); err != nil {
-				return fmt.Errorf("installing %s: %w", pkg.Name, err)
-			}
-
-			expanded[i] = exp
-			close(done[i])
-
-			return nil
-		})
-	}
+		return nil
+	})
 
 	if err := g.Wait(); err != nil {
-		return fmt.Errorf("installing packages: %w", err)
+		return err
+	}
+
+	// TODO: This will be wrong unless we coordinate or pre-calculate it.
+	for i, pkg := range allpkgs {
+		exp := expanded[i]
+		if exp == nil {
+			continue
+		}
+		if err := a.installPackage(ctx, pkg, exp, sourceDateEpoch); err != nil {
+			return fmt.Errorf("installing %s: %w", pkg.Name, err)
+		}
 	}
 
 	return nil
@@ -767,6 +845,12 @@ func (a *APK) cachedPackage(ctx context.Context, pkg *repository.RepositoryPacka
 		return nil, err
 	}
 
+	hdr := filepath.Join(cacheDir, datahash+".hdr.jsonl.gz")
+	if _, err := os.Stat(hdr); err != nil {
+		return nil, err
+	}
+	exp.HeaderFile = hdr
+
 	return &exp, nil
 }
 
@@ -880,6 +964,70 @@ func (a *APK) fetchPackage(ctx context.Context, pkg *repository.RepositoryPackag
 	default:
 		return nil, fmt.Errorf("repository scheme %s not supported", asURL.Scheme)
 	}
+}
+
+func (a *APK) indexFiles(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded) (map[string]tar.Header, error) {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "indexFiles", trace.WithAttributes(attribute.String("package", pkg.Name)))
+	defer span.End()
+
+	headers := map[string]tar.Header{}
+
+	f, err := os.Open(expanded.HeaderFile)
+	if err != nil {
+		return nil, fmt.Errorf("opening header file %q: %w", expanded.HeaderFile, err)
+	}
+
+	size := int(expanded.Size)
+	if size > 0 && meg < size {
+		size = meg
+	}
+
+	zr, err := gzip.NewReader(bufio.NewReaderSize(f, size))
+	if err != nil {
+		return nil, fmt.Errorf("unzipping header file %q: %w", expanded.HeaderFile, err)
+	}
+	defer zr.Close()
+
+	dec := json.NewDecoder(zr)
+
+	for {
+		hdr := tar.Header{}
+
+		if err := dec.Decode(&hdr); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			return nil, fmt.Errorf("decoding header: %w", err)
+		}
+
+		headers[hdr.Name] = hdr
+	}
+
+	return headers, nil
+}
+
+func (a *APK) installPackageFiles2(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded, sourceDateEpoch *time.Time, headers map[string]tar.Header, indexes []map[string]tar.Header) error {
+	a.logger.Debugf("installing %s (%s)", pkg.Name, pkg.Version)
+
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "installPackageFiles", trace.WithAttributes(attribute.String("package", pkg.Name)))
+	defer span.End()
+
+	defer expanded.Close()
+
+	packageData, err := expanded.PackageData()
+	if err != nil {
+		return fmt.Errorf("opening package file %q: %w", expanded.PackageFile, err)
+	}
+	defer packageData.Close()
+
+	installedFiles, err := a.installAPKFiles2(ctx, packageData, pkg.Origin, pkg.Replaces, headers, indexes)
+	if err != nil {
+		return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)
+	}
+
+	expanded.InstalledFiles = installedFiles
+	return nil
 }
 
 func (a *APK) installPackageFiles(ctx context.Context, pkg *repository.RepositoryPackage, expanded *APKExpanded, sourceDateEpoch *time.Time) error {
