@@ -19,12 +19,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/hashicorp/go-retryablehttp"
 	"go.opentelemetry.io/otel"
+	"golang.org/x/exp/slices"
 )
 
 // NamedIndex an index that contains all of its packages,
@@ -190,6 +192,8 @@ type PkgResolver struct {
 	providesMap  map[string][]*repositoryPackage
 	installIfMap map[string][]*repositoryPackage // contains any package that should be installed if the named package is installed
 
+	disqualified map[string]string
+
 	parsedVersions map[string]packageVersion
 	depForVersion  map[string]pinStuff
 }
@@ -214,6 +218,7 @@ func NewPkgResolver(ctx context.Context, indexes []NamedIndex) *PkgResolver {
 		indexes:        indexes,
 		parsedVersions: map[string]packageVersion{},
 		depForVersion:  map[string]pinStuff{},
+		disqualified:   map[string]string{},
 	}
 
 	// create a map of every package by name and version to its RepositoryPackage
@@ -257,28 +262,104 @@ func NewPkgResolver(ctx context.Context, indexes []NamedIndex) *PkgResolver {
 	return p
 }
 
+// We select the next package based on the smallest number of candidate packages.
+func (p *PkgResolver) nextPackage(packages []string) (string, error) {
+	best := ""
+	fewestOptions := math.MaxInt
+
+	for _, pkgName := range packages {
+		pkgs, err := p.ResolvePackage(pkgName)
+		if err != nil {
+			return "", err
+		}
+		if len(pkgs) == 0 {
+			return "", fmt.Errorf("could not find package %s", pkgName)
+		}
+
+		if deps := len(pkgs); deps < fewestOptions {
+			best = pkgName
+			fewestOptions = deps
+		}
+	}
+
+	return best, nil
+}
+
+func (p *PkgResolver) isDisqualified(pkg *RepositoryPackage) bool {
+	_, ok := p.disqualified[pkg.Filename()]
+	return ok
+}
+
+func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage) error {
+	for _, prov := range pkg.Provides {
+		name := p.resolvePackageNameVersionPin(prov).name
+		providers, ok := p.providesMap[name]
+		if !ok {
+			continue
+		}
+
+		for _, conflict := range providers {
+			if conflict.RepositoryPackage == pkg {
+				continue
+			}
+
+			p.disqualified[conflict.Filename()] = pkg.Filename()
+		}
+	}
+
+	return nil
+}
+
 // GetPackagesWithDependencies get all of the dependencies for the given packages based on the
 // indexes. Does not filter for installed already or not.
 func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages []string) (toInstall []*RepositoryPackage, conflicts []string, err error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "GetPackageWithDependencies")
 	defer span.End()
 
+	constraints := slices.Clone(packages)
+
 	var (
 		dependenciesMap = make(map[string]*RepositoryPackage, len(packages))
 		installTracked  = map[string]*RepositoryPackage{}
 	)
-	// first get the explicitly named packages
-	for _, pkgName := range packages {
-		pkgs, err := p.ResolvePackage(pkgName)
+
+	// First, handle explicitly named packages.
+	// We iteratively contrain the solution space by:
+	//   1. finding the "hardest" constraint to solve,
+	//   2. selecting the latest allowed package that satisfies the constraint, and
+	//   3. disqualifying any packages that have overlapping provides.
+	//
+	// TODO: Instead of only solving top-level constraints this way, we should
+	//       enqueue all the selected package's dependencies as additional constraints.
+	//       This requires rewriting most of the solver :/
+	for len(constraints) != 0 {
+		next, err := p.nextPackage(constraints)
 		if err != nil {
 			return nil, nil, err
 		}
-		if len(pkgs) == 0 {
-			return nil, nil, fmt.Errorf("could not find package %s", pkgName)
+
+		pkgs, err := p.ResolvePackage(next)
+		if err != nil {
+			return nil, nil, err
 		}
+
+		if len(pkgs) == 0 {
+			return nil, nil, fmt.Errorf("could not find package %s", next)
+		}
+
 		// do not add it to toInstall, as we want to have it in the correct order with dependencies
 		dependenciesMap[pkgs[0].Name] = pkgs[0]
+
+		// Remove it from contraints.
+		constraints = slices.DeleteFunc(constraints, func(s string) bool {
+			return s == next
+		})
+
+		if err := p.disqualifyConflicts(pkgs[0]); err != nil {
+			return nil, nil, err
+		}
 	}
+
 	// now get the dependencies for each package
 	for _, pkgName := range packages {
 		pkg, deps, confs, err := p.GetPackageWithDependencies(pkgName, dependenciesMap)
@@ -411,6 +492,9 @@ func (p *PkgResolver) ResolvePackage(pkgName string) ([]*RepositoryPackage, erro
 	}
 	pkgs := make([]*RepositoryPackage, 0, len(packages))
 	for _, pkg := range packages {
+		if p.isDisqualified(pkg.RepositoryPackage) {
+			continue
+		}
 		pkgs = append(pkgs, pkg.RepositoryPackage)
 	}
 	return pkgs, nil
@@ -535,6 +619,11 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 					isSelf = true
 					break
 				}
+
+				if p.isDisqualified(provider.RepositoryPackage) {
+					continue
+				}
+
 				providers = append(providers, provider)
 			}
 			if isSelf {
@@ -544,6 +633,9 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 			p.sortPackages(providers, pkg, name, existing, "")
 			depPkg = providers[0].RepositoryPackage
 		}
+
+		p.disqualifyConflicts(depPkg)
+
 		// and then recurse to its children
 		// each child gets the parental chain, but should not affect any others,
 		// so we duplicate the map for the child
