@@ -19,12 +19,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/hashicorp/go-retryablehttp"
 	"go.opentelemetry.io/otel"
+	"golang.org/x/exp/slices"
 )
 
 // NamedIndex an index that contains all of its packages,
@@ -188,6 +190,10 @@ type PkgResolver struct {
 	providesMap  map[string][]*repositoryPackage
 	installIfMap map[string][]*repositoryPackage // contains any package that should be installed if the named package is installed
 
+	// Keep track of all the constraints we have already chosen.
+	constraints map[string][]pinStuff
+	provisions  map[string]*RepositoryPackage
+
 	parsedVersions map[string]packageVersion
 	depForVersion  map[string]pinStuff
 }
@@ -210,6 +216,8 @@ func NewPkgResolver(ctx context.Context, indexes []NamedIndex) *PkgResolver {
 	)
 	p := &PkgResolver{
 		indexes:        indexes,
+		constraints:    map[string][]pinStuff{},
+		provisions:     map[string]*RepositoryPackage{},
 		parsedVersions: map[string]packageVersion{},
 		depForVersion:  map[string]pinStuff{},
 	}
@@ -267,22 +275,32 @@ func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages 
 	)
 	// first get the explicitly named packages
 	for _, pkgName := range packages {
-		pkgs, err := p.ResolvePackage(pkgName)
-		if err != nil {
-			return nil, nil, err
+		stuff := p.resolvePackageNameVersionPin(pkgName)
+		if _, ok := p.constraints[stuff.name]; !ok {
+			p.constraints[stuff.name] = []pinStuff{}
 		}
-		if len(pkgs) == 0 {
-			return nil, nil, fmt.Errorf("could not find package %s", pkgName)
-		}
-		// do not add it to toInstall, as we want to have it in the correct order with dependencies
-		dependenciesMap[pkgs[0].Name] = pkgs[0]
+		p.constraints[stuff.name] = append(p.constraints[stuff.name], stuff)
 	}
+
+	// This doesn't seem right actually.
+	// for _, pkgName := range packages {
+	// 	pkgs, err := p.ResolvePackage(pkgName)
+	// 	if err != nil {
+	// 		return nil, nil, err
+	// 	}
+	// 	if len(pkgs) == 0 {
+	// 		return nil, nil, fmt.Errorf("could not find package %s", pkgName)
+	// 	}
+	// 	// do not add it to toInstall, as we want to have it in the correct order with dependencies
+	// 	dependenciesMap[pkgs[0].Name] = pkgs[0]
+	// }
 	// now get the dependencies for each package
 	for _, pkgName := range packages {
 		pkg, deps, confs, err := p.GetPackageWithDependencies(pkgName, dependenciesMap)
 		if err != nil {
 			return nil, nil, err
 		}
+		dependenciesMap[pkg.Name] = pkg
 		for _, dep := range deps {
 			if _, ok := installTracked[dep.Name]; !ok {
 				toInstall = append(toInstall, dep)
@@ -327,6 +345,25 @@ func (p *PkgResolver) GetPackageWithDependencies(pkgName string, existing map[st
 		return nil, nil, nil, fmt.Errorf("could not find package %s", pkgName)
 	}
 	pkg := pkgs[0]
+
+	for _, prov := range pkg.Provides {
+		if prev, ok := p.provisions[prov]; ok {
+			if pkg.Origin == prev.Origin {
+				continue
+			}
+
+			return nil, nil, nil, fmt.Errorf("cannot install %s: %q already provided by %s", pkg.Filename(), prov, prev.Filename())
+		}
+
+		if before, after, ok := strings.Cut(prov, "="); ok {
+			p.provisions[before] = pkg
+			p.provisions[before+"="+after] = pkg
+		} else {
+			p.provisions[prov] = pkg
+		}
+	}
+
+	p.provisions[pkg.Name] = pkg
 
 	pin := p.resolvePackageNameVersionPin(pkgName).pin
 	deps, conflicts, err := p.getPackageDependencies(pkg, pin, true, parents, localExisting)
@@ -387,15 +424,25 @@ func (p *PkgResolver) GetPackageWithDependencies(pkgName string, existing map[st
 // returns multiple in case you need to see all potential matches.
 func (p *PkgResolver) ResolvePackage(pkgName string) ([]*RepositoryPackage, error) {
 	stuff := p.resolvePackageNameVersionPin(pkgName)
-	name, version, compare, pin := stuff.name, stuff.version, stuff.dep, stuff.pin
+	name, pin := stuff.name, stuff.pin
 	pkgsWithVersions, ok := p.nameMap[name]
 	var packages []*repositoryPackage
 	if ok {
-		// pkgsWithVersions contains a map of all versions of the package
-		// get the one that most matches what was requested
-		packages = p.filterPackages(pkgsWithVersions, withVersion(version, compare), withPreferPin(pin))
-		if len(packages) == 0 {
-			return nil, fmt.Errorf("could not find package %s in indexes", pkgName)
+		packages = slices.Clone(pkgsWithVersions)
+		filters := []pinStuff{stuff}
+
+		if constraints, ok := p.constraints[name]; ok {
+			filters = append(filters, constraints...)
+		}
+
+		for _, filter := range filters {
+			version, compare, pin := filter.version, filter.dep, filter.pin
+			// pkgsWithVersions contains a map of all versions of the package
+			// get the one that most matches what was requested
+			packages = p.filterPackages(packages, withVersion(version, compare), withPreferPin(pin))
+			if len(packages) == 0 {
+				return nil, fmt.Errorf("could not find package %s in indexes", pkgName)
+			}
 		}
 		p.sortPackages(packages, nil, name, nil, pin)
 	} else {
@@ -477,6 +524,11 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 			continue
 		}
 
+		if prev, ok := p.provisions[name]; ok {
+			log.Printf("%q is already provided by %s", name, prev.Filename())
+			continue
+		}
+
 		if allowSelfFulfill && pkg.Name == name {
 			var (
 				actualVersion, requiredVersion packageVersion
@@ -498,15 +550,23 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 		// first see if it is a name of a package
 		depPkgWithVersions, ok := p.nameMap[name]
 		if ok {
-			// pkgsWithVersions contains a map of all versions of the package
-			// get the one that most matches what was requested
-			pkgs := p.filterPackages(depPkgWithVersions,
-				withVersion(version, compare),
-				withAllowPin(allowPin),
-				withInstalledPackage(existing[name]),
-			)
-			if len(pkgs) == 0 {
-				return nil, nil, fmt.Errorf("could not find package %s in indexes", dep)
+			pkgs := slices.Clone(depPkgWithVersions)
+			filters := []pinStuff{stuff}
+			if constraints, ok := p.constraints[name]; ok {
+				filters = append(filters, constraints...)
+			}
+			for _, filter := range filters {
+				version, compare := filter.version, filter.dep
+				// pkgsWithVersions contains a map of all versions of the package
+				// get the one that most matches what was requested
+				pkgs = p.filterPackages(pkgs,
+					withVersion(version, compare),
+					withAllowPin(allowPin),
+					withInstalledPackage(existing[name]),
+				)
+				if len(pkgs) == 0 {
+					return nil, nil, fmt.Errorf("could not find package %s in indexes", dep)
+				}
 			}
 			p.sortPackages(pkgs, nil, name, existing, "")
 			depPkg = pkgs[0].RepositoryPackage
@@ -542,6 +602,28 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 			p.sortPackages(providers, pkg, name, existing, "")
 			depPkg = providers[0].RepositoryPackage
 		}
+
+		for _, prov := range depPkg.Provides {
+			if prev, ok := p.provisions[prov]; ok {
+				if depPkg.Origin == prev.Origin {
+					continue
+				}
+
+				return nil, nil, fmt.Errorf("cannot install %s: %q already provided by %s", depPkg.Filename(), prov, prev.Filename())
+			}
+
+			if before, after, ok := strings.Cut(prov, "="); ok {
+				p.provisions[before] = depPkg
+				p.provisions[before+"="+after] = depPkg
+			} else {
+				p.provisions[prov] = depPkg
+			}
+		}
+
+		if allowSelfFulfill {
+			p.provisions[depPkg.Name] = depPkg
+		}
+
 		// and then recurse to its children
 		// each child gets the parental chain, but should not affect any others,
 		// so we duplicate the map for the child

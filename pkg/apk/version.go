@@ -343,6 +343,7 @@ const (
 	versionGreaterEqual
 	versionLessEqual
 	versionTilde
+	versionConflict
 )
 
 func (v versionDependency) satisfies(actualVersion, requiredVersion packageVersion) bool {
@@ -368,11 +369,48 @@ func (v versionDependency) satisfies(actualVersion, requiredVersion packageVersi
 	}
 }
 
+func (v versionDependency) String() string {
+	switch v {
+	case versionEqual:
+		return "="
+	case versionGreater:
+		return ">"
+	case versionLess:
+		return "<"
+	case versionGreaterEqual:
+		return ">="
+	case versionLessEqual:
+		return "<="
+	case versionTilde:
+		return "~"
+	case versionConflict:
+		return "!"
+	case versionNone:
+		return ""
+	default:
+		panic(v)
+	}
+}
+
 type pinStuff struct {
 	name    string
 	version string
 	dep     versionDependency
 	pin     string
+}
+
+func (p pinStuff) String() string {
+	if p.dep == versionConflict {
+		return "!" + p.name
+	}
+
+	s := p.name + p.dep.String() + p.version
+
+	if p.pin == "" {
+		return s
+	}
+
+	return s + "@" + p.pin
 }
 
 func resolvePackageNameVersionPin(pkgName string) pinStuff {

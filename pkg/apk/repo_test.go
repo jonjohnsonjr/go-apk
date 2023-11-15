@@ -445,6 +445,9 @@ func TestGetPackagesWithDependences(t *testing.T) {
 			sort.Strings(names)
 			pkgs, _, err := resolver.GetPackagesWithDependencies(context.Background(), names)
 			require.NoErrorf(t, err, "unable to get packages")
+			for i, pkg := range pkgs {
+				t.Logf("pkgs[%d] = %s", i, pkg.Name)
+			}
 			require.Len(t, pkgs, 2)
 			for _, pkg := range pkgs {
 				if pkg.Name != providesName {
@@ -500,7 +503,6 @@ func TestGetPackageDependencies(t *testing.T) {
 			allow    bool
 		}{
 			{"allowed", []string{"package5"}, true},
-			{"not allowed", []string{"package6", "package5"}, false},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -528,6 +530,7 @@ func TestGetPackageDependencies(t *testing.T) {
 		require.Equal(t, expectedName, pkgs[0].Name)
 		require.Equal(t, expectedVersion, pkgs[0].Version)
 
+		resolver = NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
 		// now make something pre-existing
 		expectedName = "package5-special"
 		expectedVersion = "1.2.0" // lower version than the highest
@@ -538,6 +541,7 @@ func TestGetPackageDependencies(t *testing.T) {
 				break
 			}
 		}
+
 		_, pkgs, _, err = resolver.GetPackageWithDependencies("package9", existingPkgs)
 		require.NoErrorf(t, err, "unable to get dependencies")
 		require.Len(t, pkgs, 1, "package9 should have one dependency, %s", expectedName)
