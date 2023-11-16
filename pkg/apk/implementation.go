@@ -550,6 +550,10 @@ func (a *APK) FixateWorld(ctx context.Context, sourceDateEpoch *time.Time) error
 		}
 	}
 
+	return a.InstallPackages(ctx, sourceDateEpoch, allpkgs)
+}
+
+func (a *APK) InstallPackages(ctx context.Context, sourceDateEpoch *time.Time, allpkgs []*RepositoryPackage) error {
 	// TODO: Consider making this configurable option.
 	jobs := runtime.GOMAXPROCS(0)
 
