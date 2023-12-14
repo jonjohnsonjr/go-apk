@@ -366,6 +366,7 @@ func testGetPackagesAndIndex() ([]*RepositoryPackage, []*RepositoryWithIndex) {
 			{Name: "package8", Version: "2", Provides: []string{"package7=0.9"}},
 			{Name: "package9", Version: "2.0.0", Dependencies: []string{"package5"}},
 			{Name: "abc9", Version: "2.0.0", Dependencies: []string{"package5"}},
+			{Name: "locked-dep", Version: "2.0.0", Dependencies: []string{"package5=1.5.1"}},
 		}
 		repoPackages = make([]*RepositoryPackage, 0, len(packages))
 	)
@@ -470,13 +471,13 @@ func TestGetPackagesWithDependences(t *testing.T) {
 		// because they both provide package5.
 		_, index := testGetPackagesAndIndex()
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		names := []string{"package9", "package5=1.5.1"}
+		names := []string{"package5", "locked-dep"}
 		sort.Strings(names)
 		install, _, err := resolver.GetPackagesWithDependencies(context.Background(), names)
 		require.NoError(t, err)
 		want := []string{
 			"package5-1.5.1",
-			"package9-2.0.0",
+			"locked-dep-2.0.0",
 		}
 		for i := range install {
 			got := install[i].Package.Name + "-" + install[i].Package.Version
