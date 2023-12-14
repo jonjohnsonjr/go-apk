@@ -459,6 +459,9 @@ func (p *PkgResolver) filterPackages(pkgs []*repositoryPackage, opts ...filterOp
 		installedURL = o.installed.URL()
 	}
 	for _, pkg := range pkgs {
+		if p.isDisqualified(pkg.RepositoryPackage) {
+			continue
+		}
 		// do we allow this package?
 
 		// if it has a pinned name, and it is not preferred or allowed, we reject it immediately
