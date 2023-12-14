@@ -358,8 +358,8 @@ func testGetPackagesAndIndex() ([]*RepositoryPackage, []*RepositoryWithIndex) {
 			{Name: "package5", Version: "1.5.0"},
 			{Name: "package5", Version: "1.5.1"},
 			{Name: "package5", Version: "2.0.0"},
-			{Name: "package5-special", Version: "1.2.0", Provides: []string{"package5=1.2.0"}},
-			{Name: "package5-conflict", Version: "1.2.0", Provides: []string{"package5=1.2.0"}},
+			{Name: "package5-special", Version: "1.2.0", Provides: []string{"package5"}},
+			{Name: "package5-conflict", Version: "1.2.0", Provides: []string{"package5"}},
 			{Name: "package6", Version: "1.5.1"},
 			{Name: "package6", Version: "2.0.0", Dependencies: []string{"package6", "package5"}},
 			{Name: "package7", Version: "1"},
@@ -456,18 +456,32 @@ func TestGetPackagesWithDependences(t *testing.T) {
 		})
 	})
 	t.Run("conflicting provides", func(t *testing.T) {
-		// If a dependency is resolved by something in world, i.e. the explicit package list,
-		// that should override anything that comes up in dependencies, even if a higher version.
-		// This test checks that an override on something that provides package5, or even is package5,
-		// even with a lower version, will take priority.
-		// we use abc9 -> package5 rather than package9 -> package5, because world sorts alphabetically,
-		// and we want to ensure that, even though abc9 is processed first, package5 override still works.
+		// Test that we can't install both package5-special and package5-conflict
+		// because they both provide package5.
 		_, index := testGetPackagesAndIndex()
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
 		names := []string{"package5-special", "package5-conflict", "abc9"}
 		sort.Strings(names)
 		_, _, err := resolver.GetPackagesWithDependencies(context.Background(), names)
 		require.Error(t, err, "provided package should conflict")
+	})
+	t.Run("locked versions", func(t *testing.T) {
+		// Test that we can't install both package5-special and package5-conflict
+		// because they both provide package5.
+		_, index := testGetPackagesAndIndex()
+		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
+		names := []string{"package9", "package5=1.5.1"}
+		sort.Strings(names)
+		install, _, err := resolver.GetPackagesWithDependencies(context.Background(), names)
+		require.NoError(t, err)
+		want := []string{
+			"package5-1.5.1",
+			"package9-2.0.0",
+		}
+		for i := range install {
+			got := install[i].Package.Name + "-" + install[i].Package.Version
+			require.Equal(t, got, want[i])
+		}
 	})
 }
 
