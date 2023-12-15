@@ -291,6 +291,7 @@ func (p *PkgResolver) isDisqualified(pkg *RepositoryPackage) bool {
 }
 
 func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage) error {
+	// Disqualify any packages with overlapping Provides.
 	for _, prov := range pkg.Provides {
 		name := p.resolvePackageNameVersionPin(prov).name
 		providers, ok := p.providesMap[name]
@@ -304,6 +305,22 @@ func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage) error {
 			}
 
 			p.disqualified[conflict.Filename()] = pkg.Filename()
+		}
+	}
+
+	// Disqualify any packages that provide things we exclude.
+	for _, dep := range pkg.Dependencies {
+		if !strings.HasPrefix(dep, "!") {
+			continue
+		}
+
+		pkgs, err := p.ResolvePackage(strings.TrimPrefix(dep, "!"))
+		if err != nil {
+			return fmt.Errorf("trying to conflict: %w", err)
+		}
+
+		for _, dq := range pkgs {
+			p.disqualified[dq.Filename()] = pkg.Filename()
 		}
 	}
 
@@ -610,6 +627,10 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 				providers []*repositoryPackage
 			)
 			for _, provider := range initialProviders {
+				if p.isDisqualified(provider.RepositoryPackage) {
+					continue
+				}
+
 				// if the provider package is pinned and does not match our allowed pin, skip it
 				if provider.pinnedName != "" && provider.pinnedName != allowPin {
 					continue
@@ -618,10 +639,6 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 				if provider.Name == pkg.Name {
 					isSelf = true
 					break
-				}
-
-				if p.isDisqualified(provider.RepositoryPackage) {
-					continue
 				}
 
 				providers = append(providers, provider)
