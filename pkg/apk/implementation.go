@@ -993,8 +993,8 @@ func (a *APK) FetchPackage(ctx context.Context, pkg InstallablePackage) (io.Read
 	}
 }
 
-type writeHeaderer interface {
-	WriteHeader(hdr tar.Header, tfs fs.FS, pkg *Package) error
+type WriteHeaderer interface {
+	WriteHeader(hdr tar.Header, tfs fs.FS, pkg *Package) (bool, error)
 }
 
 func packageInfo(exp *expandapk.APKExpanded) (*Package, error) {
@@ -1035,7 +1035,7 @@ func (a *APK) installPackage(ctx context.Context, pkg *Package, expanded *expand
 		installedFiles []tar.Header
 	)
 
-	if wh, ok := a.fs.(writeHeaderer); ok {
+	if wh, ok := a.fs.(WriteHeaderer); ok {
 		installedFiles, err = a.lazilyInstallAPKFiles(ctx, wh, expanded.TarFS, pkg)
 		if err != nil {
 			return fmt.Errorf("unable to install files for pkg %s: %w", pkg.Name, err)

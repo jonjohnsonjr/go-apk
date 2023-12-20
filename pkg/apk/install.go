@@ -342,7 +342,7 @@ func checksumFromHeader(header *tar.Header) ([]byte, error) {
 // to provide much cheaper access to the file data when we read it later.
 //
 // This is an optimizing fastpath for when a.fs is a specific implementation that supports it.
-func (a *APK) lazilyInstallAPKFiles(ctx context.Context, wh writeHeaderer, tf *tarfs.FS, pkg *Package) ([]tar.Header, error) {
+func (a *APK) lazilyInstallAPKFiles(ctx context.Context, wh WriteHeaderer, tf *tarfs.FS, pkg *Package) ([]tar.Header, error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "lazilyInstallAPKFiles")
 	defer span.End()
 
@@ -361,7 +361,7 @@ func (a *APK) lazilyInstallAPKFiles(ctx context.Context, wh writeHeaderer, tf *t
 		// whatever it is now, it is in the data section
 		startedDataSection = true
 
-		if err := wh.WriteHeader(file.Header, tf, pkg); err != nil {
+		if _, err := wh.WriteHeader(file.Header, tf, pkg); err != nil {
 			return nil, err
 		}
 
