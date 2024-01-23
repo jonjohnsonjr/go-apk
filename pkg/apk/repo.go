@@ -27,6 +27,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-retryablehttp"
 	"go.opentelemetry.io/otel"
+	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slices"
 )
 
@@ -263,31 +264,120 @@ func NewPkgResolver(ctx context.Context, indexes []NamedIndex) *PkgResolver {
 	return p
 }
 
+// We select the next package based on the smallest number of candidate packages.
+func (p *PkgResolver) nextPackage(packages []string, dq map[*RepositoryPackage]string) (string, error) {
+	next := ""
+	leastDeps := 0
+
+	// first get the explicitly named packages
+	for _, pkgName := range packages {
+		pkgs, err := p.ResolvePackage(pkgName, dq)
+		if err != nil {
+			return "", err
+		}
+		if len(pkgs) == 0 {
+			return "", fmt.Errorf("could not find package %s", pkgName)
+		}
+
+		if next == "" {
+			next = pkgName
+			leastDeps = len(pkgs)
+			continue
+		}
+
+		if deps := len(pkgs); deps < leastDeps {
+			next = pkgName
+			leastDeps = deps
+		}
+	}
+
+	return next, nil
+}
+
+func (p *PkgResolver) disqualifyProviders(constraint string, dq map[*RepositoryPackage]string) {
+	parsed := p.resolvePackageNameVersionPin(constraint)
+	providers, ok := p.providesMap[parsed.name]
+	if !ok {
+		return
+	}
+
+	conflicting := p.filterPackages(providers, dq, withVersion(parsed.version, parsed.dep), withPreferPin(parsed.pin))
+
+	for _, conflict := range conflicting {
+		if _, dqed := dq[conflict.RepositoryPackage]; dqed {
+			// Already disqualified, don't bother generating reason.
+			continue
+		}
+
+		dq[conflict.RepositoryPackage] = "excluded by !" + constraint
+	}
+}
+
+func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage, dq map[*RepositoryPackage]string) {
+	for _, prov := range pkg.Provides {
+		name := p.resolvePackageNameVersionPin(prov).name
+		providers, ok := p.providesMap[name]
+		if !ok {
+			continue
+		}
+
+		for _, conflict := range providers {
+			if conflict.RepositoryPackage == pkg {
+				continue
+			}
+
+			if _, dqed := dq[conflict.RepositoryPackage]; dqed {
+				// Already disqualified, don't bother generating reason.
+				continue
+			}
+
+			dq[conflict.RepositoryPackage] = pkg.Filename() + " already provides " + name
+		}
+	}
+}
+
 // GetPackagesWithDependencies get all of the dependencies for the given packages based on the
 // indexes. Does not filter for installed already or not.
 func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages []string) (toInstall []*RepositoryPackage, conflicts []string, err error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "GetPackageWithDependencies")
 	defer span.End()
 
+	// Tracks all the packages we have disqualified and the reason we disqualified them.
+	dq := map[*RepositoryPackage]string{}
+
+	// We're going to mutate this as our set of input packages to install, so make a copy.
+	constraints := slices.Clone(packages)
+
 	var (
 		dependenciesMap = make(map[string]*RepositoryPackage, len(packages))
 		installTracked  = map[string]*RepositoryPackage{}
 	)
-	// first get the explicitly named packages
-	for _, pkgName := range packages {
-		pkgs, err := p.ResolvePackage(pkgName)
+
+	for len(constraints) != 0 {
+		next, err := p.nextPackage(constraints, dq)
 		if err != nil {
 			return nil, nil, err
 		}
-		if len(pkgs) == 0 {
-			return nil, nil, fmt.Errorf("could not find package %s", pkgName)
+
+		pkg, err := p.resolvePackage(next, dq)
+		if err != nil {
+			return nil, nil, err
 		}
+
 		// do not add it to toInstall, as we want to have it in the correct order with dependencies
-		dependenciesMap[pkgs[0].Name] = pkgs[0]
+		dependenciesMap[pkg.Name] = pkg
+
+		// Remove it from contraints.
+		constraints = slices.DeleteFunc(constraints, func(s string) bool {
+			return s == next
+		})
+
+		p.disqualifyConflicts(pkg, dq)
 	}
+
 	// now get the dependencies for each package
 	for _, pkgName := range packages {
-		pkg, deps, confs, err := p.GetPackageWithDependencies(pkgName, dependenciesMap)
+		pkg, deps, confs, err := p.GetPackageWithDependencies(pkgName, dependenciesMap, dq)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -320,7 +410,7 @@ func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages 
 // Requires the existing set because the logic for resolving dependencies between competing
 // options may depend on whether or not one already is installed.
 // Must not modify the existing map directly.
-func (p *PkgResolver) GetPackageWithDependencies(pkgName string, existing map[string]*RepositoryPackage) (*RepositoryPackage, []*RepositoryPackage, []string, error) {
+func (p *PkgResolver) GetPackageWithDependencies(pkgName string, existing map[string]*RepositoryPackage, dq map[*RepositoryPackage]string) (*RepositoryPackage, []*RepositoryPackage, []string, error) {
 	parents := make(map[string]bool)
 	localExisting := make(map[string]*RepositoryPackage, len(existing))
 	existingOrigins := map[string]bool{}
@@ -331,17 +421,13 @@ func (p *PkgResolver) GetPackageWithDependencies(pkgName string, existing map[st
 		}
 	}
 
-	pkgs, err := p.ResolvePackage(pkgName)
+	pkg, err := p.resolvePackage(pkgName, dq)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if len(pkgs) == 0 {
-		return nil, nil, nil, fmt.Errorf("could not find package %s", pkgName)
-	}
-	pkg := pkgs[0]
 
 	pin := p.resolvePackageNameVersionPin(pkgName).pin
-	deps, conflicts, err := p.getPackageDependencies(pkg, pin, true, parents, localExisting, existingOrigins)
+	deps, conflicts, err := p.getPackageDependencies(pkg, pin, true, parents, localExisting, existingOrigins, dq)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -397,7 +483,7 @@ func (p *PkgResolver) GetPackageWithDependencies(pkgName string, existing map[st
 // that satisfy the constraint. The list will be sorted by version number, with the highest version first
 // and decreasing from there. In general, the first one in the list is the best match. This function
 // returns multiple in case you need to see all potential matches.
-func (p *PkgResolver) ResolvePackage(pkgName string) ([]*RepositoryPackage, error) {
+func (p *PkgResolver) ResolvePackage(pkgName string, dq map[*RepositoryPackage]string) ([]*RepositoryPackage, error) {
 	constraint := p.resolvePackageNameVersionPin(pkgName)
 	name, version, compare, pin := constraint.name, constraint.version, constraint.dep, constraint.pin
 	pkgsWithVersions, ok := p.nameMap[name]
@@ -405,9 +491,9 @@ func (p *PkgResolver) ResolvePackage(pkgName string) ([]*RepositoryPackage, erro
 	if ok {
 		// pkgsWithVersions contains a map of all versions of the package
 		// get the one that most matches what was requested
-		packages = p.filterPackages(pkgsWithVersions, withVersion(version, compare), withPreferPin(pin))
+		packages = p.filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
 		if len(packages) == 0 {
-			return nil, fmt.Errorf("could not find package %s in indexes", pkgName)
+			return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
 		}
 		p.sortPackages(packages, nil, name, nil, nil, pin)
 	} else {
@@ -421,9 +507,45 @@ func (p *PkgResolver) ResolvePackage(pkgName string) ([]*RepositoryPackage, erro
 	}
 	pkgs := make([]*RepositoryPackage, 0, len(packages))
 	for _, pkg := range packages {
+		if _, dqed := dq[pkg.RepositoryPackage]; dqed {
+			continue
+		}
 		pkgs = append(pkgs, pkg.RepositoryPackage)
 	}
 	return pkgs, nil
+}
+
+// This is like ResolvePackage but we only care about the best match and not all matches.
+func (p *PkgResolver) resolvePackage(pkgName string, dq map[*RepositoryPackage]string) (*RepositoryPackage, error) {
+	constraint := p.resolvePackageNameVersionPin(pkgName)
+	name, version, compare, pin := constraint.name, constraint.version, constraint.dep, constraint.pin
+	pkgsWithVersions, ok := p.nameMap[name]
+	if ok {
+		// pkgsWithVersions contains a map of all versions of the package
+		// get the one that most matches what was requested
+		packages := p.filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
+		if len(packages) == 0 {
+			return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
+		}
+		return p.bestPackage(packages, nil, name, nil, nil, pin).RepositoryPackage, nil
+	}
+
+	providers, ok := p.providesMap[name]
+	if !ok || len(providers) == 0 {
+		return nil, fmt.Errorf("could not find package, alias or a package that provides %s in indexes", pkgName)
+	}
+	pkgs := make([]*RepositoryPackage, 0, len(providers))
+	for _, pkg := range providers {
+		if _, dqed := dq[pkg.RepositoryPackage]; dqed {
+			continue
+		}
+		pkgs = append(pkgs, pkg.RepositoryPackage)
+	}
+	if len(pkgs) == 0 {
+		return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
+	}
+
+	return p.bestPackage(providers, nil, name, nil, nil, "").RepositoryPackage, nil
 }
 
 // getPackageDependencies get all of the dependencies for a single package based on the
@@ -454,7 +576,7 @@ func (p *PkgResolver) ResolvePackage(pkgName string) ([]*RepositoryPackage, erro
 // It might change the order of install.
 // In other words, this _should_ be a DAG (acyclical), but because the packages
 // are just listing dependencies in text, it might be cyclical. We need to be careful of that.
-func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin string, allowSelfFulfill bool, parents map[string]bool, existing map[string]*RepositoryPackage, existingOrigins map[string]bool) (dependencies []*RepositoryPackage, conflicts []string, err error) {
+func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin string, allowSelfFulfill bool, parents map[string]bool, existing map[string]*RepositoryPackage, existingOrigins map[string]bool, dq map[*RepositoryPackage]string) (dependencies []*RepositoryPackage, conflicts []string, err error) {
 	// check if the package we are checking is one of our parents, avoid cyclical graphs
 	if _, ok := parents[pkg.Name]; ok {
 		return nil, nil, nil
@@ -467,91 +589,142 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 		myProvides[name] = true
 	}
 
-	// each dependency has only one of two possibilities:
-	// - !name     - "I cannot be installed along with the package <name>"
-	// - name      - "I need package 'name'" -OR- "I need the package that provides <name>"
-	for _, dep := range pkg.Dependencies {
-		var (
-			depPkg *RepositoryPackage
-			ok     bool
-		)
-		// if it was a conflict, just add it to the conflicts list and go to the next one
-		if strings.HasPrefix(dep, "!") {
-			conflicts = append(conflicts, dep[1:])
-			continue
-		}
-		// this package might be pinned to a version
-		constraint := p.resolvePackageNameVersionPin(dep)
-		name, version, compare := constraint.name, constraint.version, constraint.dep
-		// see if we provide this
-		if myProvides[name] || myProvides[dep] {
-			// we provide this, so skip it
-			continue
-		}
+	constraints := slices.Clone(pkg.Dependencies)
 
-		if allowSelfFulfill && pkg.Name == name {
-			var (
-				actualVersion, requiredVersion packageVersion
-				err1, err2                     error
-			)
-			actualVersion, err1 = p.parseVersion(pkg.Version)
-			if compare != versionAny {
-				requiredVersion, err2 = p.parseVersion(version)
-			}
-			// we accept invalid versions for ourself, but do not try to use it to fulfill
-			if err1 == nil && err2 == nil {
-				if compare.satisfies(actualVersion, requiredVersion) {
-					// we provide it, so skip looking elsewhere
-					continue
-				}
-			}
-		}
+	for len(constraints) != 0 {
+		options := map[string][]*repositoryPackage{}
 
-		// first see if it is a name of a package
-		depPkgWithVersions, ok := p.nameMap[name]
-		if ok {
-			// pkgsWithVersions contains a map of all versions of the package
-			// get the one that most matches what was requested
-			pkgs := p.filterPackages(depPkgWithVersions,
-				withVersion(version, compare),
-				withAllowPin(allowPin),
-				withInstalledPackage(existing[name]),
-			)
-			if len(pkgs) == 0 {
-				return nil, nil, fmt.Errorf("could not find package %s in indexes", dep)
-			}
-			depPkg = p.bestPackage(pkgs, nil, name, existing, existingOrigins, "").RepositoryPackage
-		} else {
-			// it was not the name of a package, see if some package provides this
-			initialProviders, ok := p.providesMap[name]
-			if !ok || len(initialProviders) == 0 {
-				// no one provides it, return an error
-				return nil, nil, fmt.Errorf("could not find package either named %s or that provides %s for %s", dep, dep, pkg.Name)
-			}
-			// before we sort the packages, figure out if we satisfy the dependency
-			// also filter out invalid ones, i.e. ones that come from a pinned repository, but that pin is now allowed
-			var (
-				isSelf    bool
-				providers []*repositoryPackage
-			)
-			for _, provider := range initialProviders {
-				// if the provider package is pinned and does not match our allowed pin, skip it
-				if provider.pinnedName != "" && provider.pinnedName != allowPin {
-					continue
-				}
-				// if my package can provide this dependency, then already satisfied
-				if provider.Name == pkg.Name {
-					isSelf = true
-					break
-				}
-				providers = append(providers, provider)
-			}
-			if isSelf {
+		// each dependency has only one of two possibilities:
+		// - !name     - "I cannot be installed along with the package <name>"
+		// - name      - "I need package 'name'" -OR- "I need the package that provides <name>"
+		for _, dep := range constraints {
+			if strings.HasPrefix(dep, "!") {
+				p.disqualifyProviders(dep[1:], dq)
+
+				// TODO: This is a little strange, we should revisit why we do this.
+				conflicts = append(conflicts, dep[1:])
+
+				// If it was a conflict, we don't need to find a provider.
 				continue
 			}
-			// we are going to do this in reverse order
-			depPkg = p.bestPackage(providers, pkg, name, existing, existingOrigins, "").RepositoryPackage
+
+			// this package might be pinned to a version
+			constraint := p.resolvePackageNameVersionPin(dep)
+			name, version, compare := constraint.name, constraint.version, constraint.dep
+			// see if we provide this
+			if myProvides[name] || myProvides[dep] {
+				// we provide this, so skip it
+				continue
+			}
+
+			if allowSelfFulfill && pkg.Name == name {
+				var (
+					actualVersion, requiredVersion packageVersion
+					err1, err2                     error
+				)
+				actualVersion, err1 = p.parseVersion(pkg.Version)
+				if compare != versionAny {
+					requiredVersion, err2 = p.parseVersion(version)
+				}
+				// we accept invalid versions for ourself, but do not try to use it to fulfill
+				if err1 == nil && err2 == nil {
+					if compare.satisfies(actualVersion, requiredVersion) {
+						// we provide it, so skip looking elsewhere
+						continue
+					}
+				}
+			}
+
+			// first see if it is a name of a package
+			depPkgWithVersions, ok := p.nameMap[name]
+			if ok {
+				// pkgsWithVersions contains a map of all versions of the package
+				// get the one that most matches what was requested
+				pkgs := p.filterPackages(depPkgWithVersions,
+					dq,
+					withVersion(version, compare),
+					withAllowPin(allowPin),
+					withInstalledPackage(existing[name]),
+				)
+				if len(pkgs) == 0 {
+					return nil, nil, maybedqerror(dep, depPkgWithVersions, dq)
+				}
+				options[dep] = pkgs
+			} else {
+				// it was not the name of a package, see if some package provides this
+				initialProviders, ok := p.providesMap[name]
+				if !ok || len(initialProviders) == 0 {
+					// no one provides it, return an error
+					return nil, nil, fmt.Errorf("could not find package either named %s or that provides %s for %s", dep, dep, pkg.Name)
+				}
+				// before we sort the packages, figure out if we satisfy the dependency
+				// also filter out invalid ones, i.e. ones that come from a pinned repository, but that pin is now allowed
+				var (
+					isSelf    bool
+					providers []*repositoryPackage
+				)
+				for _, provider := range initialProviders {
+					// if the provider package is pinned and does not match our allowed pin, skip it
+					if provider.pinnedName != "" && provider.pinnedName != allowPin {
+						continue
+					}
+					// if my package can provide this dependency, then already satisfied
+					if provider.Name == pkg.Name {
+						isSelf = true
+						break
+					}
+
+					if _, dqed := dq[provider.RepositoryPackage]; dqed {
+						continue
+					}
+
+					providers = append(providers, provider)
+				}
+				if isSelf {
+					continue
+				}
+
+				if len(providers) == 0 {
+					return nil, nil, maybedqerror(dep, initialProviders, dq)
+				}
+
+				options[dep] = providers
+			}
 		}
+
+		constraints = maps.Keys(options)
+		if len(constraints) == 0 {
+			// Nothing left to solve.
+			continue
+		}
+
+		// Find the constraint with the fewest solutions.
+		lowest := ""
+		for k, v := range options {
+			if lowest == "" || len(v) < len(options[lowest]) {
+				lowest = k
+			} else if len(v) == len(options[lowest]) && k < lowest {
+				// This is a little janky, but since map order is non-deterministic, we want to break ties.
+				lowest = k
+			}
+		}
+
+		pkgs := options[lowest]
+		name := p.resolvePackageNameVersionPin(lowest).name
+
+		// Remove this from our constraints.
+		constraints = slices.DeleteFunc(constraints, func(s string) bool {
+			return s == lowest
+		})
+
+		best := p.bestPackage(pkgs, nil, name, existing, existingOrigins, "")
+		if best == nil {
+			return nil, nil, fmt.Errorf("could not find package for %q", name)
+		}
+
+		depPkg := best.RepositoryPackage
+		p.disqualifyConflicts(depPkg, dq)
+
 		// and then recurse to its children
 		// each child gets the parental chain, but should not affect any others,
 		// so we duplicate the map for the child
@@ -560,7 +733,7 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 			childParents[k] = true
 		}
 		childParents[pkg.Name] = true
-		subDeps, confs, err := p.getPackageDependencies(depPkg, allowPin, true, childParents, existing, existingOrigins)
+		subDeps, confs, err := p.getPackageDependencies(depPkg, allowPin, true, childParents, existing, existingOrigins, dq)
 		if err != nil {
 			return nil, nil, err
 		}
