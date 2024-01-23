@@ -358,13 +358,15 @@ func testGetPackagesAndIndex() ([]*RepositoryPackage, []*RepositoryWithIndex) {
 			{Name: "package5", Version: "1.5.0"},
 			{Name: "package5", Version: "1.5.1"},
 			{Name: "package5", Version: "2.0.0"},
-			{Name: "package5-special", Version: "1.2.0", Provides: []string{"package5=1.2.0"}},
+			{Name: "package5-special", Version: "1.2.0", Provides: []string{"package5"}},
+			{Name: "package5-conflict", Version: "1.2.0", Provides: []string{"package5"}},
 			{Name: "package6", Version: "1.5.1"},
 			{Name: "package6", Version: "2.0.0", Dependencies: []string{"package6", "package5"}},
 			{Name: "package7", Version: "1"},
 			{Name: "package8", Version: "2", Provides: []string{"package7=0.9"}},
 			{Name: "package9", Version: "2.0.0", Dependencies: []string{"package5"}},
 			{Name: "abc9", Version: "2.0.0", Dependencies: []string{"package5"}},
+			{Name: "locked-dep", Version: "2.0.0", Dependencies: []string{"package5=1.5.1"}},
 		}
 		repoPackages = make([]*RepositoryPackage, 0, len(packages))
 	)
@@ -384,7 +386,7 @@ func TestGetPackagesWithDependences(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		names := []string{"package1", "package2"}
-		expectedPackage1 := []string{"dep4", "dep5", "dep1", "dep6", "foo", "libq", "dep3", "busybox", "dep2", "package1"}
+		expectedPackage1 := []string{"dep4", "dep5", "dep1", "busybox", "foo", "dep6", "libq", "dep3", "dep2", "package1"}
 		expectedPackage2 := []string{"dep7", "package2"}
 		expected := make([]string, 0, len(expectedPackage1)+len(expectedPackage2))
 		expected = append(expected, expectedPackage1...)
@@ -454,16 +456,45 @@ func TestGetPackagesWithDependences(t *testing.T) {
 			}
 		})
 	})
+	t.Run("conflicting provides", func(t *testing.T) {
+		// Test that we can't install both package5-special and package5-conflict
+		// because they both provide package5.
+		_, index := testGetPackagesAndIndex()
+		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
+		names := []string{"package5-special", "package5-conflict", "abc9"}
+		sort.Strings(names)
+		_, _, err := resolver.GetPackagesWithDependencies(context.Background(), names)
+		require.Error(t, err, "provided package should conflict")
+	})
+	t.Run("locked versions", func(t *testing.T) {
+		// Test that we can't install both package5-special and package5-conflict
+		// because they both provide package5.
+		_, index := testGetPackagesAndIndex()
+		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
+		names := []string{"package5", "locked-dep"}
+		sort.Strings(names)
+		install, _, err := resolver.GetPackagesWithDependencies(context.Background(), names)
+		require.NoError(t, err)
+		want := []string{
+			"package5-1.5.1",
+			"locked-dep-2.0.0",
+		}
+		require.Equal(t, len(install), len(want))
+		for i := range install {
+			got := install[i].Package.Name + "-" + install[i].Package.Version
+			require.Equal(t, got, want[i])
+		}
+	})
 }
 
 func TestGetPackageDependencies(t *testing.T) {
 	t.Run("normal dependencies", func(t *testing.T) {
 		// getPackageDependencies does not get the same dependencies twice.
-		expected := []string{"dep4", "dep5", "dep1", "dep6", "foo", "libq", "dep3", "busybox", "dep2"}
+		expected := []string{"dep4", "dep5", "dep1", "busybox", "foo", "dep6", "libq", "dep3", "dep2"}
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		_, pkgs, _, err := resolver.GetPackageWithDependencies("package1", nil)
+		_, pkgs, _, err := resolver.GetPackageWithDependencies("package1", nil, map[*RepositoryPackage]string{})
 		require.NoErrorf(t, err, "unable to get dependencies")
 
 		actual := make([]string, 0, len(pkgs))
@@ -478,7 +509,7 @@ func TestGetPackageDependencies(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		_, pkgs, _, err := resolver.GetPackageWithDependencies("package3", nil)
+		_, pkgs, _, err := resolver.GetPackageWithDependencies("package3", nil, map[*RepositoryPackage]string{})
 		require.NoErrorf(t, err, "unable to get dependencies")
 
 		actual := make([]string, 0, len(pkgs))
@@ -491,7 +522,7 @@ func TestGetPackageDependencies(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		pkg6, err := resolver.ResolvePackage("package6")
+		pkg6, err := resolver.ResolvePackage("package6", map[*RepositoryPackage]string{})
 		require.NoErrorf(t, err, "unable to resolve package6")
 		require.GreaterOrEqual(t, len(pkg6), 1, "package6 should have at least one match")
 		tests := []struct {
@@ -504,7 +535,7 @@ func TestGetPackageDependencies(t *testing.T) {
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
-				deps, _, err := resolver.getPackageDependencies(pkg6[0], "", tt.allow, nil, nil, nil)
+				deps, _, err := resolver.getPackageDependencies(pkg6[0], "", tt.allow, nil, nil, nil, map[*RepositoryPackage]string{})
 				require.NoErrorf(t, err, "unable to get dependencies")
 
 				actual := make([]string, 0, len(deps))
@@ -522,7 +553,7 @@ func TestGetPackageDependencies(t *testing.T) {
 		// start with regular resolution, just to compare
 		expectedName := "package5"
 		expectedVersion := "2.0.0" // highest version
-		_, pkgs, _, err := resolver.GetPackageWithDependencies("package9", nil)
+		_, pkgs, _, err := resolver.GetPackageWithDependencies("package9", nil, map[*RepositoryPackage]string{})
 		require.NoErrorf(t, err, "unable to get dependencies")
 		require.Len(t, pkgs, 1, "package9 should have one dependency, %s", expectedName)
 		require.Equal(t, expectedName, pkgs[0].Name)
@@ -538,7 +569,7 @@ func TestGetPackageDependencies(t *testing.T) {
 				break
 			}
 		}
-		_, pkgs, _, err = resolver.GetPackageWithDependencies("package9", existingPkgs)
+		_, pkgs, _, err = resolver.GetPackageWithDependencies("package9", existingPkgs, map[*RepositoryPackage]string{})
 		require.NoErrorf(t, err, "unable to get dependencies")
 		require.Len(t, pkgs, 1, "package9 should have one dependency, %s", expectedName)
 		require.Equal(t, expectedName, pkgs[0].Name)
@@ -552,7 +583,7 @@ func TestResolvePackage(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		pkgs, err := resolver.ResolvePackage("package12")
+		pkgs, err := resolver.ResolvePackage("package12", map[*RepositoryPackage]string{})
 		require.Error(t, err)
 		require.Len(t, pkgs, 0)
 	})
@@ -561,9 +592,9 @@ func TestResolvePackage(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		pkgs, err := resolver.ResolvePackage("package5")
+		pkgs, err := resolver.ResolvePackage("package5", map[*RepositoryPackage]string{})
 		require.NoError(t, err)
-		require.Len(t, pkgs, 5)
+		require.Len(t, pkgs, 6)
 	})
 	t.Run("specific version", func(t *testing.T) {
 		// getPackageDependencies does not get the same dependencies twice.
@@ -571,14 +602,14 @@ func TestResolvePackage(t *testing.T) {
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
 		version := "1.0.0"
-		pkgs, err := resolver.ResolvePackage("package5=" + version)
+		pkgs, err := resolver.ResolvePackage("package5="+version, map[*RepositoryPackage]string{})
 		require.NoError(t, err)
 		require.Len(t, pkgs, 1)
 		require.Equal(t, version, pkgs[0].Version)
 
 		// and now one that does not exist
 		version = "1.0.1"
-		pkgs, err = resolver.ResolvePackage("package5=" + version)
+		pkgs, err = resolver.ResolvePackage("package5="+version, map[*RepositoryPackage]string{})
 		require.Error(t, err, "package5 version 1.0.1 does not exist")
 		require.Len(t, pkgs, 0)
 	})
@@ -587,9 +618,9 @@ func TestResolvePackage(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		pkgs, err := resolver.ResolvePackage("package5>1.0.0")
+		pkgs, err := resolver.ResolvePackage("package5>1.0.0", map[*RepositoryPackage]string{})
 		require.NoError(t, err)
-		require.Len(t, pkgs, 4)
+		require.Len(t, pkgs, 5)
 		// first version should be highest match
 		require.Equal(t, "2.0.0", pkgs[0].Version)
 	})
@@ -598,7 +629,7 @@ func TestResolvePackage(t *testing.T) {
 		_, index := testGetPackagesAndIndex()
 
 		resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes(index))
-		pkgs, err := resolver.ResolvePackage("package7")
+		pkgs, err := resolver.ResolvePackage("package7", map[*RepositoryPackage]string{})
 		require.NoError(t, err)
 		require.Len(t, pkgs, 2)
 		// first version should be highest match
