@@ -195,7 +195,6 @@ func (a *APK) GetRepositoryIndexes(ctx context.Context, ignoreSignatures bool) (
 type PkgResolver struct {
 	indexes      []NamedIndex
 	nameMap      map[string][]*repositoryPackage
-	providesMap  map[string][]*repositoryPackage
 	installIfMap map[string][]*repositoryPackage // contains any package that should be installed if the named package is installed
 
 	parsedVersions map[string]packageVersion
@@ -214,9 +213,8 @@ func NewPkgResolver(ctx context.Context, indexes []NamedIndex) *PkgResolver {
 	}
 
 	var (
-		pkgNameMap     = make(map[string][]*repositoryPackage, numPackages)
-		pkgProvidesMap = make(map[string][]*repositoryPackage, numPackages)
-		installIfMap   = map[string][]*repositoryPackage{}
+		pkgNameMap   = make(map[string][]*repositoryPackage, numPackages)
+		installIfMap = map[string][]*repositoryPackage{}
 	)
 	p := &PkgResolver{
 		indexes:        indexes,
@@ -252,15 +250,10 @@ func NewPkgResolver(ctx context.Context, indexes []NamedIndex) *PkgResolver {
 			for _, provide := range pkg.Provides {
 				name := p.resolvePackageNameVersionPin(provide).name
 				pkgNameMap[name] = append(pkgNameMap[name], pkg)
-				if _, ok := pkgProvidesMap[name]; !ok {
-					pkgProvidesMap[name] = []*repositoryPackage{}
-				}
-				pkgProvidesMap[name] = append(pkgProvidesMap[name], pkg)
 			}
 		}
 	}
 	p.nameMap = pkgNameMap
-	p.providesMap = pkgProvidesMap
 	p.installIfMap = installIfMap
 	return p
 }
@@ -297,7 +290,7 @@ func (p *PkgResolver) nextPackage(packages []string, dq map[*RepositoryPackage]s
 
 func (p *PkgResolver) disqualifyProviders(constraint string, dq map[*RepositoryPackage]string) {
 	parsed := p.resolvePackageNameVersionPin(constraint)
-	providers, ok := p.providesMap[parsed.name]
+	providers, ok := p.nameMap[parsed.name]
 	if !ok {
 		return
 	}
@@ -317,7 +310,7 @@ func (p *PkgResolver) disqualifyProviders(constraint string, dq map[*RepositoryP
 func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage, dq map[*RepositoryPackage]string) {
 	for _, prov := range pkg.Provides {
 		name := p.resolvePackageNameVersionPin(prov).name
-		providers, ok := p.providesMap[name]
+		providers, ok := p.nameMap[name]
 		if !ok {
 			continue
 		}
@@ -488,24 +481,17 @@ func (p *PkgResolver) ResolvePackage(pkgName string, dq map[*RepositoryPackage]s
 	constraint := p.resolvePackageNameVersionPin(pkgName)
 	name, version, compare, pin := constraint.name, constraint.version, constraint.dep, constraint.pin
 	pkgsWithVersions, ok := p.nameMap[name]
-	var packages []*repositoryPackage
-	if ok {
-		// pkgsWithVersions contains a map of all versions of the package
-		// get the one that most matches what was requested
-		packages = p.filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
-		if len(packages) == 0 {
-			return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
-		}
-		p.sortPackages(packages, nil, name, nil, nil, pin)
-	} else {
-		providers, ok := p.providesMap[name]
-		if !ok || len(providers) == 0 {
-			return nil, fmt.Errorf("could not find package, alias or a package that provides %s in indexes", pkgName)
-		}
-		// we are going to do this in reverse order
-		p.sortPackages(providers, nil, name, nil, nil, "")
-		packages = providers
+	if !ok {
+		return nil, fmt.Errorf("could not find package, alias or a package that provides %s in indexes", pkgName)
 	}
+
+	// pkgsWithVersions contains a map of all versions of the package
+	// get the one that most matches what was requested
+	packages := p.filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
+	if len(packages) == 0 {
+		return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
+	}
+	p.sortPackages(packages, nil, name, nil, nil, pin)
 	pkgs := make([]*RepositoryPackage, 0, len(packages))
 	for _, pkg := range packages {
 		if _, dqed := dq[pkg.RepositoryPackage]; dqed {
@@ -520,33 +506,19 @@ func (p *PkgResolver) ResolvePackage(pkgName string, dq map[*RepositoryPackage]s
 func (p *PkgResolver) resolvePackage(pkgName string, dq map[*RepositoryPackage]string) (*RepositoryPackage, error) {
 	constraint := p.resolvePackageNameVersionPin(pkgName)
 	name, version, compare, pin := constraint.name, constraint.version, constraint.dep, constraint.pin
-	pkgsWithVersions, ok := p.nameMap[name]
-	if ok {
-		// pkgsWithVersions contains a map of all versions of the package
-		// get the one that most matches what was requested
-		packages := p.filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
-		if len(packages) == 0 {
-			return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
-		}
-		return p.bestPackage(packages, nil, name, nil, nil, pin).RepositoryPackage, nil
-	}
 
-	providers, ok := p.providesMap[name]
-	if !ok || len(providers) == 0 {
+	pkgsWithVersions, ok := p.nameMap[name]
+	if !ok {
 		return nil, fmt.Errorf("could not find package, alias or a package that provides %s in indexes", pkgName)
 	}
-	pkgs := make([]*RepositoryPackage, 0, len(providers))
-	for _, pkg := range providers {
-		if _, dqed := dq[pkg.RepositoryPackage]; dqed {
-			continue
-		}
-		pkgs = append(pkgs, pkg.RepositoryPackage)
-	}
-	if len(pkgs) == 0 {
+
+	// pkgsWithVersions contains a map of all versions of the package
+	// get the one that most matches what was requested
+	packages := p.filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
+	if len(packages) == 0 {
 		return nil, maybedqerror(pkgName, pkgsWithVersions, dq)
 	}
-
-	return p.bestPackage(providers, nil, name, nil, nil, "").RepositoryPackage, nil
+	return p.bestPackage(packages, nil, name, nil, nil, pin).RepositoryPackage, nil
 }
 
 // getPackageDependencies get all of the dependencies for a single package based on the
@@ -638,59 +610,21 @@ func (p *PkgResolver) getPackageDependencies(pkg *RepositoryPackage, allowPin st
 
 			// first see if it is a name of a package
 			depPkgWithVersions, ok := p.nameMap[name]
-			if ok {
-				// pkgsWithVersions contains a map of all versions of the package
-				// get the one that most matches what was requested
-				pkgs := p.filterPackages(depPkgWithVersions,
-					dq,
-					withVersion(version, compare),
-					withAllowPin(allowPin),
-					withInstalledPackage(existing[name]),
-				)
-				if len(pkgs) == 0 {
-					return nil, nil, maybedqerror(dep, depPkgWithVersions, dq)
-				}
-				options[dep] = pkgs
-			} else {
-				// it was not the name of a package, see if some package provides this
-				initialProviders, ok := p.providesMap[name]
-				if !ok || len(initialProviders) == 0 {
-					// no one provides it, return an error
-					return nil, nil, fmt.Errorf("could not find package either named %s or that provides %s for %s", dep, dep, pkg.Name)
-				}
-				// before we sort the packages, figure out if we satisfy the dependency
-				// also filter out invalid ones, i.e. ones that come from a pinned repository, but that pin is now allowed
-				var (
-					isSelf    bool
-					providers []*repositoryPackage
-				)
-				for _, provider := range initialProviders {
-					// if the provider package is pinned and does not match our allowed pin, skip it
-					if provider.pinnedName != "" && provider.pinnedName != allowPin {
-						continue
-					}
-					// if my package can provide this dependency, then already satisfied
-					if provider.Name == pkg.Name {
-						isSelf = true
-						break
-					}
-
-					if _, dqed := dq[provider.RepositoryPackage]; dqed {
-						continue
-					}
-
-					providers = append(providers, provider)
-				}
-				if isSelf {
-					continue
-				}
-
-				if len(providers) == 0 {
-					return nil, nil, maybedqerror(dep, initialProviders, dq)
-				}
-
-				options[dep] = providers
+			if !ok {
+				return nil, nil, fmt.Errorf("could not find package either named %s or that provides %s for %s", dep, dep, pkg.Name)
 			}
+			// pkgsWithVersions contains a map of all versions of the package
+			// get the one that most matches what was requested
+			pkgs := p.filterPackages(depPkgWithVersions,
+				dq,
+				withVersion(version, compare),
+				withAllowPin(allowPin),
+				withInstalledPackage(existing[name]),
+			)
+			if len(pkgs) == 0 {
+				return nil, nil, maybedqerror(dep, depPkgWithVersions, dq)
+			}
+			options[dep] = pkgs
 		}
 
 		constraints = maps.Keys(options)
